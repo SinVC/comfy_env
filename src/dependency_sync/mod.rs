@@ -108,6 +108,25 @@ impl UvClient {
             .map(str::to_owned)
             .collect())
     }
+
+    pub fn export_pylock(&self, project_dir: &Path) -> Result<CmdResult> {
+        run_uv(uv_command().current_dir(project_dir).args([
+            "export",
+            "--format",
+            "pylock.toml",
+            "--locked",
+            "--all-groups",
+        ]))
+    }
+
+    pub fn lock_check(&self, project_dir: &Path) -> Result<CmdResult> {
+        run_uv(uv_command().current_dir(project_dir).args([
+            "lock",
+            "--check",
+            "--python",
+            &self.python,
+        ]))
+    }
 }
 
 pub fn create_staged_workdir(root: &ProjectRoot) -> Result<StagedWorkdir> {

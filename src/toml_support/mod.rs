@@ -126,6 +126,26 @@ pub fn read_config(path: &Path) -> Result<Option<RuntimeConfig>> {
     Ok(Some(config))
 }
 
+pub fn set_import_config(path: &Path, comfyui_dir: &Path, python: &str) -> Result<()> {
+    let text = crate::fs_support::read_text_if_exists(path)?.unwrap_or_default();
+    let mut doc = text.parse::<DocumentMut>()?;
+    let paths = doc
+        .as_table_mut()
+        .entry("paths")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .context("paths must be a table")?;
+    paths["comfyui_dir"] = value(comfyui_dir.to_string_lossy().as_ref());
+    let runtime = doc
+        .as_table_mut()
+        .entry("runtime")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .context("runtime must be a table")?;
+    runtime["python"] = value(python);
+    crate::fs_support::atomic_write(path, doc.to_string().as_bytes())
+}
+
 pub fn read_dependency_group(path: &Path, group: &str) -> Result<Vec<String>> {
     dependency_group(&read_project(path)?, group)
 }

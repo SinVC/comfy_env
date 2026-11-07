@@ -123,6 +123,84 @@ pub fn remove_file_if_exists(path: &Path) -> Result<()> {
     fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
 }
 
+pub fn copy_tree(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
+    let kind = fs::symlink_metadata(src)?.file_type();
+    ensure_regular_tree_entry(src, &kind)?;
+    if kind.is_file() {
+        return copy_file(src, dst);
+    }
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if exclude
+            .iter()
+            .any(|skip| name == std::ffi::OsStr::new(skip))
+        {
+            continue;
+        }
+        copy_tree(&entry.path(), &dst.join(name), exclude)?;
+    }
+    Ok(())
+}
+
+pub fn copy_tree_preserving_links(src: &Path, dst: &Path) -> Result<()> {
+    let kind = fs::symlink_metadata(src)?.file_type();
+    if kind.is_symlink() {
+        let link_target = fs::read_link(src)?;
+        let parent = dst.parent().context("linked entry has no parent")?;
+        fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&link_target, dst)?;
+        #[cfg(windows)]
+        if fs::metadata(src)?.is_dir() {
+            std::os::windows::fs::symlink_dir(&link_target, dst)?;
+        } else {
+            std::os::windows::fs::symlink_file(&link_target, dst)?;
+        }
+        return Ok(());
+    }
+    ensure_regular_tree_entry(src, &kind)?;
+    if kind.is_file() {
+        return copy_file(src, dst);
+    }
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        copy_tree_preserving_links(&entry.path(), &dst.join(entry.file_name()))?;
+    }
+    Ok(())
+}
+
+fn ensure_regular_tree_entry(path: &Path, kind: &fs::FileType) -> Result<()> {
+    anyhow::ensure!(
+        kind.is_file() || kind.is_dir(),
+        "linked or special entry is not supported: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+pub fn remove_tree(path: &Path) -> Result<()> {
+    let kind = fs::symlink_metadata(path)?.file_type();
+    if kind.is_symlink() {
+        if fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+            return fs::remove_dir(path)
+                .with_context(|| format!("failed to remove link {}", path.display()));
+        }
+        return fs::remove_file(path)
+            .with_context(|| format!("failed to remove link {}", path.display()));
+    }
+    ensure_regular_tree_entry(path, &kind)?;
+    if kind.is_file() {
+        return remove_file_if_exists(path);
+    }
+    for entry in fs::read_dir(path)? {
+        remove_tree(&entry?.path())?;
+    }
+    fs::remove_dir(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
 fn sync_parent_dir(parent: &Path) {
     let _ = OpenOptions::new()
         .read(true)

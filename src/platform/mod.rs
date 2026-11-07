@@ -1,9 +1,45 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-
-#[cfg(windows)]
 use std::process::Command;
+
+pub struct PythonClient;
+
+impl PythonClient {
+    pub fn version_minor(interpreter: &Path) -> anyhow::Result<String> {
+        let output = Command::new(interpreter)
+            .args([
+                "-B",
+                "-c",
+                "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
+            ])
+            .output()?;
+        let result = crate::domain::CmdResult::from_output(output);
+        anyhow::ensure!(
+            result.success,
+            "python version lookup failed: {}",
+            result.summary_line()
+        );
+        Ok(result.stdout)
+    }
+
+    pub fn version_full(interpreter: &Path) -> anyhow::Result<String> {
+        let output = Command::new(interpreter)
+            .args([
+                "-B",
+                "-c",
+                "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')",
+            ])
+            .output()?;
+        let result = crate::domain::CmdResult::from_output(output);
+        anyhow::ensure!(
+            result.success,
+            "python version lookup failed: {}",
+            result.summary_line()
+        );
+        Ok(result.stdout)
+    }
+}
 
 pub fn venv_python(venv_root: &Path) -> PathBuf {
     #[cfg(windows)]

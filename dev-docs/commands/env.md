@@ -23,6 +23,7 @@ Export the current environment as a portable bundle for transfer to another mach
 ### Preconditions
 
 - `pyproject.toml` and `uv.lock` must exist
+- `config.toml` and `state/plugins.json` must exist
 - All registered plugins must have their source directories present
 - Output directory must not already exist
 
@@ -41,8 +42,8 @@ Export the current environment as a portable bundle for transfer to another mach
 - `<output_dir>/state/plugins.json` — copy of registry
 - `<output_dir>/custom_nodes/<node_id>/` — source snapshots (without `.git/`)
 - `<output_dir>/manifest.json` — checksums + platform info
-- `<output_dir>/prod-freeze.txt` — `uv pip freeze` output from prod env
-- `<output_dir>/export-summary.json` — audit metadata
+- `<output_dir>/audit/prod-freeze.txt` — `uv pip freeze` output from prod env
+- `<output_dir>/audit/export-summary.json` — audit metadata
 
 ### Success Path
 
@@ -55,7 +56,7 @@ Export the current environment as a portable bundle for transfer to another mach
 6. For each registered plugin:
    - Copy custom_nodes/<node_id>/ to bundle, EXCLUDING .git/ directories
 7. Capture prod freeze: `uv pip freeze` in prod env → prod-freeze.txt
-8. Write export-summary.json:
+8. Write audit/export-summary.json:
    - timestamp, python version, platform info, plugin count, package count
 9. Write manifest.json:
    - SHA256 checksum for each payload file, excluding manifest.json itself

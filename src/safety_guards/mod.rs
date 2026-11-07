@@ -74,6 +74,9 @@ pub fn op_finalize(
         OpStatus::Failed
     };
     record.undoable = success;
+    if record.kind == OpKind::EnvImport {
+        record.undoable = false;
+    }
     record.ended_at = Some(state_ledger::now_string()?);
     record.note = note;
 
@@ -118,6 +121,80 @@ pub fn op_restore(op_id: &OpId, root: &ProjectRoot) -> Result<()> {
         }
     }
 
+    if backup_dir.join("custom_nodes.list.json").exists() {
+        restore_import_nodes(op_id, root)?;
+    }
+
+    let config_marker = backup_dir.join("config.toml.exists");
+    if config_marker.exists() {
+        crate::fs_support::restore_with_marker(
+            &backup_dir.join("config.toml"),
+            &root.config_toml(),
+            &config_marker,
+        )?;
+    }
+
+    Ok(())
+}
+
+pub fn backup_import_config(op_id: &OpId, root: &ProjectRoot) -> Result<()> {
+    let backup = root.ops_dir().join(&op_id.0).join("backup");
+    crate::fs_support::backup_with_marker(
+        &root.config_toml(),
+        &backup.join("config.toml"),
+        &backup.join("config.toml.exists"),
+    )
+}
+
+pub fn backup_import_nodes(op_id: &OpId, nodes_root: &Path, root: &ProjectRoot) -> Result<()> {
+    let backup = root.ops_dir().join(&op_id.0).join("backup");
+    let mut names = Vec::new();
+    if nodes_root.exists() {
+        for entry in std::fs::read_dir(nodes_root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            crate::fs_support::copy_tree_preserving_links(
+                &entry.path(),
+                &backup.join("custom_nodes").join(&name),
+            )?;
+            names.push(name);
+        }
+    }
+    crate::fs_support::atomic_write(
+        &backup.join("custom_nodes.root"),
+        crate::platform::to_state_path(nodes_root).as_bytes(),
+    )?;
+    crate::fs_support::atomic_write(
+        &backup.join("custom_nodes.list.json"),
+        &serde_json::to_vec(&names)?,
+    )
+}
+
+fn restore_import_nodes(op_id: &OpId, root: &ProjectRoot) -> Result<()> {
+    let backup = root.ops_dir().join(&op_id.0).join("backup");
+    let nodes_root = crate::platform::from_state_path(&std::fs::read_to_string(
+        backup.join("custom_nodes.root"),
+    )?);
+    let names: Vec<String> =
+        serde_json::from_slice(&std::fs::read(backup.join("custom_nodes.list.json"))?)?;
+    if nodes_root.exists() {
+        for entry in std::fs::read_dir(&nodes_root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                continue;
+            }
+            crate::fs_support::remove_tree(&entry.path())?;
+        }
+    }
+    for name in names {
+        crate::fs_support::copy_tree_preserving_links(
+            &backup.join("custom_nodes").join(&name),
+            &nodes_root.join(name),
+        )?;
+    }
     Ok(())
 }
 

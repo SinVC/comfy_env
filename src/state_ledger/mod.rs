@@ -142,6 +142,7 @@ pub enum OpKind {
     NodeRemove,
     PluginPromote,
     CorePromote,
+    EnvImport,
     ManualUndo,
     #[serde(untagged)]
     Historical(String),
@@ -157,6 +158,7 @@ impl std::fmt::Display for OpKind {
             Self::NodeRemove => "node_remove",
             Self::PluginPromote => "plugin_promote",
             Self::CorePromote => "core_promote",
+            Self::EnvImport => "env_import",
             Self::ManualUndo => "manual_undo",
             Self::Historical(kind) => kind,
         };
