@@ -52,7 +52,7 @@ If no `--pin` flags provided, enters interactive mode: displays conflict summary
    - Add/update resolution pins in overrides group
 7. Lock workdir: `uv lock --python <py>`
 8. IF lock succeeds:
-   - Update tx status → "resolved"
+   - Sync and observe the resolved candidate and refresh diff/core_impact before marking it resolved. A candidate setup failure stays failed.
 9. IF lock fails:
    - Write updated conflict artifact
    - tx remains "needs_resolution"

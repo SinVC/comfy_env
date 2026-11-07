@@ -36,7 +36,7 @@
 1. **初期采用单 crate。** 保留模块边界，在出现明确需求之前不拆分 workspace。
 2. **Rust `gov` 从首个版本开始就是唯一入口点。** 未实现的命令打印错误并以非零状态退出。
 3. **采用 vertical-slice migration（纵向切片迁移）。** 每个切片都交付一个完整的命令组。不采用“先做读命令、后做写命令”这种横向分期。
-4. **跨平台进程执行属于基础设施，而不是后期补充。** process runner、timeout、venv Python 定位器以及日志捕获，必须在任何会调用 `uv`、`git` 或 Python 的命令之前就存在，也就是必须在 Slice 1 之前完成。
+4. 跨平台能力随首次使用它的切片交付。pin 需要定位 venv Python 和有超时的冒烟命令，候选运行需要实时日志，run/stop 负责运行时进程管理。
 5. **状态文件 schema 兼容。** 保留现有 schema，新字段只能追加，且必须是可选的。
 6. **外部工具边界保持不变。** `uv`、`git` 和 Python 继续作为外部 CLI 调用。
 7. **命令面保持稳定。** `init`、`install`、`pin`、`node`、`tx`、`update`、`env`、`op`、`undo`、`run`、`stop`、`help`，不改名。
@@ -155,7 +155,7 @@ struct CmdResult {
 
 ## Platform Abstraction (平台抽象)
 
-跨平台关注点是**必须在 Slice 1 之前具备的基础设施**，而不是可延后处理的特性。`platform/` 模块负责所有平台分歧行为。
+平台差异归 `platform/` 管理。各切片只实现当前命令需要的能力。
 
 ### Venv Python Locator (Venv Python 定位器)
 
@@ -328,19 +328,9 @@ clap, serde, serde_json, toml_edit, anyhow, sha2, tempfile, time, getrandom
 
 ### Slice 0: Scaffold and Cross-Platform Infrastructure (Slice 0：脚手架与跨平台基础设施)
 
-在实现任何命令之前，以下内容必须先存在并完成测试：
+先交付 CLI、配置和真相文件读取、平台路径和 status 使用的工具探测。未实现的命令返回包含命令名的错误。pin/undo 引入账本和备份；候选运行引入日志流；需要恢复目录的命令再引入目录快照。
 
-- `platform/` 模块：venv Python 定位器、带 timeout 的 process runner、PID 检查、终止能力
-- `fs_support/` 模块：atomic write、SHA256、路径规范化、目录复制
-- `toml_support/` 模块：`config.toml` 读写、`pyproject.toml` 读取与编辑
-- `state_ledger/` 模块：plugins、transactions、operations、conflicts 的 JSON 读写
-- `safety_guards/` 模块：backup/restore 原语、hash guard
-- `dependency_sync/` 模块：`UvClient` wrapper
-- `source_integration/` 模块：`GitClient` wrapper
-- `cli.rs`：所有命令的 clap 定义，未实现的命令统一返回 `error: command '<name>' is not yet implemented`
-- 轻量日志抽象
-
-**Completion criteria (完成标准)**：`cargo test` 在 Linux 和 Windows 上都通过。`gov help` 可用。其他所有命令都打印“not yet implemented”。
+**完成标准**：目标平台可以运行 help 和只读 status，其余尚未实现的命令返回迁移提示。
 
 ### Slice 1: `pin add` / `pin list` / `pin remove` / `undo` / `op list` / `op inspect`
 

@@ -58,7 +58,7 @@ Export the current environment as a portable bundle for transfer to another mach
 8. Write export-summary.json:
    - timestamp, python version, platform info, plugin count, package count
 9. Write manifest.json:
-   - SHA256 checksum for every file in the bundle
+   - SHA256 checksum for each payload file, excluding manifest.json itself
    - requires-python value
    - sys_platform, platform_machine
    - tool.uv.environments marker
@@ -139,24 +139,13 @@ Import an environment from an exported bundle. This is an **exact restore** — 
 ### Success Path
 
 ```
-1. Load manifest.json
-2. Verify all file checksums in manifest
-3. Execute platform compatibility check (requires-python, sys_platform, platform_machine)
-4. IF incompatible: exit with detailed error
-5. Resolve target Python to canonical minor line
-6. Write config.toml (comfyui_dir, python)
-7. Verify lock compatibility: `uv lock --check --python <py>` against bundled truth
-8. IF lock check fails: exit with error (bundle may be corrupted or incompatible)
-9. op_begin(kind="env_import")
-10. Overwrite root truth: pyproject.toml, uv.lock from bundle
-11. Overwrite state/plugins.json from bundle
-12. Sync prod env via [Prod Sync Protocol]
-13. Synchronize custom_nodes:
-    a. Backup current custom_nodes (for restore on failure)
-    b. Remove custom_nodes directories NOT in bundle
-    c. Copy bundle custom_nodes to target (custom_nodes/<node_id>/)
-14. Smoke test via [Smoke Test Protocol]
-15. op_finalize(success)
+1. Load the manifest and resolve the requested Python minor.
+2. Check requires-python, platform and architecture, then verify payload checksums.
+3. Run `uv lock --check --python <py>` in the bundle directory.
+4. Begin the env_import operation. Back up config.toml (including prior absence) and the custom_nodes entries that will be replaced or removed, along with the usual truth files and registry.
+5. Write target config, root truth and registry, then sync prod with the locked project.
+6. Replace the affected custom_nodes trees and remove extras. Preserve linked entries as specified in ADR-003.
+7. Run the smoke command and finalize the import with undoable=false.
 ```
 
 ### Failure Path
@@ -165,9 +154,7 @@ Import an environment from an exported bundle. This is an **exact restore** — 
 IF manifest checksum mismatch: exit before mutation
 IF platform incompatible: exit before mutation
 IF lock check fails: exit before mutation
-IF sync fails: op_restore → restore custom_nodes backup → op_finalize(failed)
-IF smoke fails: op_restore → restore custom_nodes backup → op_finalize(failed)
-IF custom_nodes copy fails: op_restore → restore custom_nodes backup → op_finalize(failed)
+IF any target write, sync or smoke step fails: restore config, truth, registry and affected node trees. If a previous production lock existed, re-sync its environment using the previous config. On a fresh import, remove the environment created by this operation. Record any recovery error along with the import failure.
 ```
 
 ### Platform Notes

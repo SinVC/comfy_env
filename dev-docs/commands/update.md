@@ -49,15 +49,15 @@ Create a core update transaction that stages updated ComfyUI requirements, locks
    - `torch`, `torchvision`, and `torchaudio` are skipped, not treated as a transaction failure
 4. Record source: requirements path + sha256
 5. Create transaction record (status="running", kind="core_update")
-6. Copy truth to staged workdir
+6. Copy truth to the staged workdir and record the hashes of the two original root files.
 7. Replace dependency-groups.core in workdir with the full filtered target set
 8. Lock workdir: `uv lock --python <py>`
 9. Create candidate env: sync workdir to .venv-candidate/<txid>/
-10. Capture pre/post freeze
+10. Capture the production freeze as the baseline.
 11. Run ComfyUI in candidate env (with timeout)
     - Mirror stdout/stderr to the terminal in real time
     - Capture the same stdout/stderr to tx log files
-12. Compute diff and core_impact
+12. Capture the candidate freeze after the run. Compare it to the production baseline to compute diff and core_impact.
 13. Update transaction:
     - status → "completed" when the run exits 0 or the observation timeout is reached
     - status → "failed" on candidate sync failure or non-zero runtime failure
@@ -134,13 +134,11 @@ At least one of `--pin` or `--pins-file` must be provided.
 2. Verify status == "needs_resolution"
 3. Collect pins from --pin flags and/or --pins-file
 4. Merge new pins into transaction's resolution_pins (append, last-wins dedup)
-5. Copy truth to staged workdir
-6. Apply original core update + all resolution pins to workdir:
-   - Replace core group with requirements
-   - Add/update resolution pins in overrides group
+5. Open the retained staged workdir from update run.
+6. Apply the merged pins to the staged overrides array. Use the core requirements already staged by this transaction.
 7. Lock workdir: `uv lock --python <py>`
 8. IF lock succeeds:
-   - Update tx status → "resolved"
+   - Sync the resulting candidate, observe it and refresh diff/core_impact before marking it resolved. Record setup or runtime failure as failed.
    - Update tx resolution_pins
 9. IF lock fails:
    - Write updated conflict artifact
@@ -176,7 +174,7 @@ Promote a core update transaction's staged snapshot to production.
 
 ### Preconditions
 
-Same as `tx promote` — status may be `completed`, `resolved`, or `failed`, and `--allow-failed-run` is required for `failed` transactions.
+Same as `tx promote` — status may be `completed`, `resolved`, or `failed`, and `--allow-failed-run` is available only for a recorded nonzero runtime exit after a successful candidate sync.
 
 ### Reads
 
@@ -195,7 +193,7 @@ Same as `tx promote` — status may be `completed`, `resolved`, or `failed`, and
 ### Success Path
 
 ```
-1. Load transaction, verify promotable
+1. Verify promotable status and that the root truth still matches the saved baseline. If another operation changed it after staging, ask the user to run a fresh update.
 2. Execute [Core Impact Gate Protocol]
 3. op_begin(kind="core_promote", reference=txid)
 4. Copy staged workdir truth → root (pyproject.toml, uv.lock)

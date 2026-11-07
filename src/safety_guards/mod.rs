@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
+use wait_timeout::ChildExt;
 
 use anyhow::{Context, Result};
 
@@ -8,11 +10,6 @@ use crate::domain::{OpId, OpStatus, ProjectRoot};
 use crate::platform;
 use crate::state_ledger::{self, OpKind, OperationRecord, TrackedFileHashes};
 use crate::toml_support::RuntimeConfig;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RestoreOutcome {
-    NeedsSync,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriftCheck {
@@ -59,7 +56,7 @@ pub fn op_begin(kind: OpKind, reference: &str, root: &ProjectRoot) -> Result<OpI
         note: None,
         undo_reference: None,
     };
-    state_ledger::create_operation(root, &record)?;
+    state_ledger::save_operation(root, &record)?;
 
     Ok(op_id)
 }
@@ -91,28 +88,31 @@ pub fn op_finalize(
     state_ledger::save_operation(root, &record)
 }
 
-pub fn op_restore(op_id: &OpId, root: &ProjectRoot) -> Result<RestoreOutcome> {
-    let record = state_ledger::load_operation(root, op_id)?;
-    let backup_dir = root.ops_dir().join(&record.op_id).join("backup");
+pub fn op_restore(op_id: &OpId, root: &ProjectRoot) -> Result<()> {
+    let backup_dir = root.ops_dir().join(&op_id.0).join("backup");
     for (name, path) in tracked_files(root) {
         let backup = backup_dir.join(name);
         let marker = backup_dir.join(format!("{name}.exists"));
+        let marker = if marker.try_exists()? {
+            marker
+        } else {
+            backup_dir.join(format!("{name}.present"))
+        };
         crate::fs_support::restore_with_marker(&backup, &path, &marker)?;
     }
 
-    Ok(RestoreOutcome::NeedsSync)
+    Ok(())
 }
 
-pub fn check_undo_drift(op_id: &OpId, root: &ProjectRoot) -> Result<DriftCheck> {
-    let record = state_ledger::load_operation(root, op_id)?;
+pub fn check_undo_drift(record: &OperationRecord, root: &ProjectRoot) -> Result<DriftCheck> {
     let mut mismatches = Vec::new();
 
     for (name, path) in tracked_files(root) {
         let Some(file) = record.files.get(name) else {
-            continue;
+            anyhow::bail!("missing post-operation file record for {name}");
         };
         let current = crate::fs_support::sha256_if_exists(&path)?;
-        if current != file.post_sha256 {
+        if current.as_deref() != file.post_sha256.as_deref().filter(|hash| !hash.is_empty()) {
             mismatches.push(name.to_string());
         }
     }
@@ -128,27 +128,42 @@ pub fn run_smoke_test(env_path: &Path, config: &RuntimeConfig) -> Result<SmokeRe
     let (program, args) = match &config.tx.smoke_test {
         Some(smoke) => {
             let program = if smoke.program == "python" {
-                platform::venv_python(env_path).to_string_lossy().to_string()
+                platform::venv_python(env_path)
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 smoke.program.clone()
             };
             (program, smoke.args.clone())
         }
         None => (
-            platform::venv_python(env_path).to_string_lossy().to_string(),
-            vec!["-c".to_string(), "import sys; print(sys.version)".to_string()],
+            platform::venv_python(env_path)
+                .to_string_lossy()
+                .to_string(),
+            vec![
+                "-c".to_string(),
+                "import sys; print(sys.version)".to_string(),
+            ],
         ),
     };
 
-    let output = Command::new(&program)
+    let mut child = Command::new(&program)
         .args(&args)
-        .output()
+        .stdout(std::io::stderr())
+        .spawn()
         .with_context(|| format!("failed to run smoke test `{program}`"))?;
-    let result = crate::domain::CmdResult::from_output(output);
-
+    let timeout = Duration::from_secs(config.tx.timeout_seconds.into());
+    if let Some(status) = child.wait_timeout(timeout)? {
+        return Ok(SmokeResult {
+            passed: status.success(),
+            detail: status.to_string(),
+        });
+    }
+    child.kill()?;
+    child.wait()?;
     Ok(SmokeResult {
-        passed: result.success,
-        detail: result.summary_line(),
+        passed: false,
+        detail: format!("timed out after {}s", timeout.as_secs()),
     })
 }
 

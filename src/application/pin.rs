@@ -1,61 +1,35 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 
 use crate::cli::PinMutateArgs;
-use crate::dependency_sync::{self, UvClient};
-use crate::domain::{AppError, AppResult, OpId, ProjectRoot};
+use crate::dependency_sync;
+use crate::domain::{AppError, AppResult, ProjectRoot};
 use crate::safety_guards;
 use crate::state_ledger::OpKind;
-use crate::toml_support::{self, RuntimeConfig};
+use crate::toml_support::{self, GroupEditMode};
 
 const TORCH_FAMILY: [&str; 3] = ["torch", "torchvision", "torchaudio"];
 const RECOMMENDED_PINS: [&str; 2] = ["numpy", "transformers"];
 
 pub fn cmd_pin_add(args: PinMutateArgs, root: &ProjectRoot) -> AppResult<()> {
-    let config = require_config(root)?;
-    let python = config_python(&config)?;
-    let specs = validate_pin_specs(&args.specs)?;
-    warn_for_non_recommended(&specs);
-    let uv = UvClient::new(python);
-
-    let op_id = safety_guards::op_begin(OpKind::PinAdd, &specs.join(", "), root)?;
-    let staged = dependency_sync::create_staged_workdir(root)?;
-
-    let mutation = (|| -> Result<()> {
-        toml_support::rewrite_dependency_group(
-            &staged.pyproject_toml(),
-            "overrides",
-            toml_support::GroupEditMode::UpsertExact,
-            &specs,
-        )?;
-
-        let lock = uv.lock(staged.path())?;
-        if !lock.success {
-            bail!("pin add failed during lock: {}", lock.summary_line());
+    for spec in &args.specs {
+        if !toml_support::is_exact_pin(spec) {
+            return Err(AppError::usage(format!("invalid pin format: {spec}")));
         }
-
-        dependency_sync::promote_workdir(&staged, root)?;
-
-        let sync = dependency_sync::sync_prod(root, &config)?;
-        if !sync.success {
-            bail!("prod sync failed during pin add: {}", sync.summary_line());
+        let name = toml_support::normalize_package_name(spec);
+        reject_torch_family(&name)?;
+        if !RECOMMENDED_PINS.contains(&name.as_str()) {
+            eprintln!("WARNING: pinning non-recommended package: {spec}");
         }
-
-        let smoke = safety_guards::run_smoke_test(&root.as_path().join(&config.runtime.prod_env), &config)?;
-        if !smoke.passed {
-            bail!("smoke test failed during pin add: {}", smoke.detail);
-        }
-
-        Ok(())
-    })();
-
-    match mutation {
-        Ok(()) => {
-            safety_guards::op_finalize(&op_id, true, None, root)?;
-            println!("Pins added.");
-            Ok(())
-        }
-        Err(error) => rollback_and_fail(&op_id, root, &config, error),
     }
+    apply_pins(
+        root,
+        &args.specs,
+        OpKind::PinAdd,
+        GroupEditMode::UpsertExact,
+        "pin add",
+    )?;
+    println!("Pins added.");
+    Ok(())
 }
 
 pub fn cmd_pin_list(root: &ProjectRoot) -> AppResult<()> {
@@ -72,102 +46,61 @@ pub fn cmd_pin_list(root: &ProjectRoot) -> AppResult<()> {
 }
 
 pub fn cmd_pin_remove(args: PinMutateArgs, root: &ProjectRoot) -> AppResult<()> {
-    let config = require_config(root)?;
-    let python = config_python(&config)?;
-    let packages = validate_remove_specs(&args.specs)?;
-    let current = toml_support::read_dependency_group(&root.pyproject_toml(), "overrides")?;
-    ensure_packages_exist(&current, &packages)?;
-    let uv = UvClient::new(python);
+    let packages = &args.specs;
+    for package in packages {
+        if !toml_support::is_package_name(package) {
+            return Err(AppError::usage(format!("invalid package name: {package}")));
+        }
+        reject_torch_family(&toml_support::normalize_package_name(package))?;
+    }
+    apply_pins(
+        root,
+        packages,
+        OpKind::PinRemove,
+        GroupEditMode::RemoveNames,
+        "pin remove",
+    )?;
+    println!("Pins removed.");
+    Ok(())
+}
 
-    let op_id = safety_guards::op_begin(OpKind::PinRemove, &packages.join(", "), root)?;
+fn apply_pins(
+    root: &ProjectRoot,
+    specs: &[String],
+    kind: OpKind,
+    mode: GroupEditMode,
+    action: &str,
+) -> AppResult<()> {
+    let (config, uv) = super::configured_uv(root)?;
     let staged = dependency_sync::create_staged_workdir(root)?;
+    toml_support::rewrite_dependency_group(&staged.pyproject_toml(), "overrides", mode, specs)?;
+    let lock = uv.lock(staged.path(), root)?;
+    if !lock.success {
+        return Err(AppError::runtime(format!(
+            "{action} failed during lock: {}",
+            lock.summary_line()
+        )));
+    }
 
+    let op_id = safety_guards::op_begin(kind, &specs.join(", "), root)?;
     let mutation = (|| -> Result<()> {
-        let remove_specs = packages.iter().map(ToString::to_string).collect::<Vec<_>>();
-        toml_support::rewrite_dependency_group(
-            &staged.pyproject_toml(),
-            "overrides",
-            toml_support::GroupEditMode::RemoveNames,
-            &remove_specs,
-        )?;
-
-        let lock = uv.lock(staged.path())?;
-        if !lock.success {
-            bail!("pin remove failed during lock: {}", lock.summary_line());
-        }
-
         dependency_sync::promote_workdir(&staged, root)?;
-
-        let sync = dependency_sync::sync_prod(root, &config)?;
-        if !sync.success {
-            bail!("prod sync failed during pin remove: {}", sync.summary_line());
-        }
-
-        let smoke = safety_guards::run_smoke_test(&root.as_path().join(&config.runtime.prod_env), &config)?;
+        uv.sync_prod(root, &config)
+            .with_context(|| format!("prod sync failed during {action}"))?;
+        let smoke =
+            safety_guards::run_smoke_test(&root.as_path().join(&config.runtime.prod_env), &config)?;
         if !smoke.passed {
-            bail!("smoke test failed during pin remove: {}", smoke.detail);
+            bail!("smoke test failed during {action}: {}", smoke.detail);
         }
-
-        Ok(())
+        safety_guards::op_finalize(&op_id, true, None, root)
     })();
-
-    match mutation {
-        Ok(()) => {
-            safety_guards::op_finalize(&op_id, true, None, root)?;
-            println!("Pins removed.");
-            Ok(())
-        }
-        Err(error) => rollback_and_fail(&op_id, root, &config, error),
+    if let Err(error) = mutation {
+        return Err(super::rollback_failed_operation(
+            root, &op_id, &config, &uv, error,
+        ));
     }
-}
-
-fn require_config(root: &ProjectRoot) -> AppResult<RuntimeConfig> {
-    toml_support::read_config(&root.config_toml())?
-        .ok_or_else(|| AppError::usage("config.toml is required for mutating pin commands"))
-}
-
-fn config_python(config: &RuntimeConfig) -> AppResult<&str> {
-    config
-        .runtime
-        .python
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| AppError::usage("config.toml is missing runtime.python"))
-}
-
-fn validate_pin_specs(specs: &[String]) -> AppResult<Vec<String>> {
-    if specs.is_empty() {
-        return Err(AppError::usage("at least one pin is required"));
-    }
-
-    for spec in specs {
-        if !toml_support::is_exact_pin(spec) {
-            return Err(AppError::usage(format!("invalid pin format: {spec}")));
-        }
-        reject_torch_family(&toml_support::normalize_package_name(spec))?;
-    }
-
-    Ok(dedupe_last_wins(specs))
-}
-
-fn validate_remove_specs(specs: &[String]) -> AppResult<Vec<String>> {
-    if specs.is_empty() {
-        return Err(AppError::usage("at least one package is required"));
-    }
-
-    let mut packages = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for spec in specs {
-        let normalized = toml_support::normalize_package_name(spec);
-        if normalized.is_empty() {
-            return Err(AppError::usage(format!("invalid package name: {spec}")));
-        }
-        reject_torch_family(&normalized)?;
-        if seen.insert(normalized.clone()) {
-            packages.push(normalized);
-        }
-    }
-    Ok(packages)
+    super::prune_history(root, &config);
+    Ok(())
 }
 
 fn reject_torch_family(name: &str) -> AppResult<()> {
@@ -177,70 +110,4 @@ fn reject_torch_family(name: &str) -> AppResult<()> {
         ));
     }
     Ok(())
-}
-
-fn warn_for_non_recommended(specs: &[String]) {
-    for spec in specs {
-        let normalized = toml_support::normalize_package_name(spec);
-        if !RECOMMENDED_PINS.contains(&normalized.as_str()) {
-            eprintln!("WARNING: pinning non-recommended package: {spec}");
-        }
-    }
-}
-
-fn dedupe_last_wins(specs: &[String]) -> Vec<String> {
-    let mut latest = std::collections::HashMap::new();
-    for (index, spec) in specs.iter().enumerate() {
-        latest.insert(toml_support::normalize_package_name(spec), (index, spec.clone()));
-    }
-    let mut ordered = latest.into_values().collect::<Vec<_>>();
-    ordered.sort_by_key(|(index, _)| *index);
-    ordered.into_iter().map(|(_, spec)| spec).collect()
-}
-
-fn ensure_packages_exist(current: &[String], requested: &[String]) -> AppResult<()> {
-    let existing = current
-        .iter()
-        .map(|spec| toml_support::normalize_package_name(spec))
-        .collect::<std::collections::HashSet<_>>();
-
-    for package in requested {
-        if !existing.contains(package) {
-            return Err(AppError::usage(format!(
-                "The dependency `{package}` could not be found in `dependency-groups.overrides`"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn rollback_and_fail(
-    op_id: &OpId,
-    root: &ProjectRoot,
-    config: &RuntimeConfig,
-    error: anyhow::Error,
-) -> AppResult<()> {
-    let note = error.to_string();
-
-    let restore = safety_guards::op_restore(op_id, root)
-        .with_context(|| format!("failed to restore after error: {note}"));
-    let sync = restore.and_then(|_| {
-        dependency_sync::sync_prod(root, config)
-            .with_context(|| format!("failed to re-sync prod after restore: {note}"))
-    });
-    let finalize = safety_guards::op_finalize(op_id, false, Some(note.clone()), root);
-
-    if let Err(finalize_error) = finalize {
-        return Err(AppError::from(anyhow!(
-            "{note}; additionally failed to finalize operation: {finalize_error:#}"
-        )));
-    }
-
-    if let Err(restore_error) = sync {
-        return Err(AppError::from(anyhow!(
-            "{note}; additionally rollback failed: {restore_error:#}"
-        )));
-    }
-
-    Err(AppError::from(anyhow!(note)))
 }

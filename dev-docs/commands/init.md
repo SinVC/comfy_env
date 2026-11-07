@@ -60,7 +60,7 @@ On re-init, flags are optional — existing values are preserved if not overridd
 5. Create directory layout (state dirs, cache dirs)
 6. Initialize plugins registry (state/plugins.json = [] if missing)
 7. Lock project: `uv lock --python <minor>`
-8. Sync prod env: `uv sync --python <minor> --locked --exact --all-groups`
+8. Sync prod env: `uv sync --python <minor> --locked --all-groups`
    with UV_PROJECT_ENVIRONMENT=<prod_env_path>
 ```
 

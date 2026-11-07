@@ -27,60 +27,14 @@ The `application/` module contains one file per command group (`pin.rs`, `tx.rs`
 
 ## Standard Command Handler Pattern
 
-Every mutating command follows this skeleton:
-
-```rust
-fn cmd_pin_add(args: PinAddArgs, config: &RuntimeConfig) -> Result<()> {
-    // 1. VALIDATE — preconditions, no I/O side effects
-    validate_pin_specs(&args.specs)?;
-    reject_torch_family(&args.specs)?;
-
-    // 2. GATE — policy checks that block before any mutation
-    // (not all commands have gates; promote commands check core impact here)
-
-    // 3. BACKUP — create operation checkpoint
-    let op_id = safety_guards::op_begin(OpKind::PinAdd, &reference, &root)?;
-
-    // 4. MUTATE — perform the change in a staged workdir
-    let workdir = dependency_sync::create_staged_workdir(&root, &work_base)?;
-    toml_support::rewrite_dependency_group(&workdir.pyproject(), ...)?;
-    let lock_result = dependency_sync::lock(&workdir)?;
-
-    // 5. HANDLE LOCK FAILURE — restore or create conflict
-    if !lock_result.success() {
-        safety_guards::op_restore(&op_id, &root)?;
-        dependency_sync::sync_prod(&root, config)?;
-        safety_guards::op_finalize(&op_id, false)?;
-        return Err(...)
-    }
-
-    // 6. PROMOTE — move staged truth to root
-    dependency_sync::promote_workdir(&workdir, &root)?;
-
-    // 7. SYNC — materialize into prod venv
-    dependency_sync::sync_prod(&root, config)?;
-
-    // 8. VERIFY — smoke test
-    let smoke = safety_guards::run_smoke_test(&prod_env, config)?;
-    if smoke.failed() {
-        safety_guards::op_restore(&op_id, &root)?;
-        dependency_sync::sync_prod(&root, config)?;
-        safety_guards::op_finalize(&op_id, false)?;
-        return Err(...)
-    }
-
-    // 9. FINALIZE — record success
-    safety_guards::op_finalize(&op_id, true)?;
-    Ok(())
-}
-```
+For pin operations, validate inputs, edit a temporary project and lock it. Start the backup after staging succeeds, immediately before the first write to production truth. Sync the production environment, run the smoke command, then finalize the operation. A staging failure releases the temporary directory. A failure during promotion, sync, smoke or finalization uses the operation backup.
 
 ### Variations by command type:
 
 | Command type | Has gate? | Has backup? | Has staged workdir? | Has smoke test? |
 |-------------|-----------|-------------|--------------------|-----------------| 
 | `pin add/remove` | No | Yes | Yes | Yes |
-| `install torch/install` | No | Yes | No (direct uv add) | Yes |
+| `install torch/install` | No | Yes | Yes | Yes |
 | `node add` | No | No | No | No |
 | `node remove` | No | Yes | Yes | Yes |
 | `tx run` | No | No | Yes (candidate, not prod) | No (run IS the test) |
@@ -133,16 +87,7 @@ fn cmd_env_export(args: ExportArgs, config: &RuntimeConfig) -> Result<()> {
 
 ## Restore Sequence
 
-When any step after `op_begin` fails, the command handler is responsible for:
-
-```rust
-// Standard restore sequence — ALWAYS this order
-safety_guards::op_restore(&op_id, &root)?;   // 1. restore files
-dependency_sync::sync_prod(&root, config)?;    // 2. re-sync venv
-safety_guards::op_finalize(&op_id, false)?;    // 3. mark op failed
-```
-
-This is NOT done inside `safety_guards` — it's the command handler's job. This avoids circular dependencies between modules.
+After a production write fails, restore the backed-up files. If restoration succeeds, sync prod against them. Record the original error and any recovery error in the failed operation, including a nonzero exit from the recovery sync. If the ledger itself cannot be written, report both errors to stderr.
 
 ## Unimplemented Commands
 

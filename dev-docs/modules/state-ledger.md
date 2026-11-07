@@ -36,6 +36,7 @@ fn list_transactions() -> Result<Vec<TransactionRecord>>
   "diff": { "added": [...], "removed": [...] },
   "core_impact": ["torch", "numpy"],
   "logs": { "stdout": "path", "stderr": "path", "run_exit_code": 0 },
+  "base_truth_sha256": { "pyproject.toml": "...", "uv.lock": "..." },
   "source_requirements_path": "optional, core_update only",
   "source_requirements_sha256": "optional",
   "conflict_report": "optional path",
@@ -51,7 +52,8 @@ fn list_transactions() -> Result<Vec<TransactionRecord>>
 
 **Invariants**:
 - `txid` is immutable once created
-- Only `status`, `resolution_pins`, `promotion`, `ended_at`, `conflict_report` mutate after creation
+- Core updates record `base_truth_sha256` when staging. For an older transaction with no recorded baseline, start a fresh update before promotion.
+- Observation fields are populated after candidate execution and refreshed after resolution. The recorded production baseline stays fixed.
 - `candidate_env` and `staged_workdir` retain their original path strings even if the referenced directories are later cleaned after `promote` or `abort`
 - Read path must tolerate missing optional fields (schema evolution)
 
@@ -101,7 +103,7 @@ fn prune_operations(retention_count: u32) -> Result<u32>
 - `op_id` is immutable
 - `status` transitions: `running` → `success`|`failed`, `success` → `undone`
 - Backup directory is co-located: `state/ops/<op_id>/backup/`
-- Pruning deletes oldest operations beyond retention_count (keeps backups of recent ops)
+- Following a successful mutation or undo, prune the oldest finished operations by start time beyond retention_count (default 100, minimum 1). Keep running records and report pruning errors as warnings.
 
 ### 3. Plugin Registry
 

@@ -33,21 +33,16 @@ If failure:
 - Update meta.json: status = "failed", undoable = false
 
 ```rust
-fn op_restore(op_id: &OpId, root: &Path) -> Result<RestoreOutcome>
+fn op_restore(op_id: &OpId, root: &Path) -> Result<()>
 ```
 
 1. Restore truth files from backup (via existence markers)
 2. If custom_nodes were backed up: restore them
-3. Return `RestoreOutcome::NeedsSync`
+3. Return a file restoration error to the caller if any restore step fails.
 
 **Contract**: `op_restore` only restores files. It does NOT call prod sync. The **command layer** is responsible for calling `dependency_sync::sync_prod()` after restore. This avoids a circular dependency between `safety_guards` and `dependency_sync`.
 
-Typical command-layer restore sequence:
-```
-safety_guards::op_restore(op_id, root)?;
-dependency_sync::sync_prod(root, config)?;
-safety_guards::op_finalize(op_id, false)?;
-```
+See the [application recovery sequence](application.md#restore-sequence) for sync and failure reporting.
 
 ### 2. Undo Drift Guard
 

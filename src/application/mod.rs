@@ -15,7 +15,10 @@ use crate::cli::{
     Cli, Commands, EnvSubcommand, InstallSubcommand, NodeSubcommand, OpSubcommand, PinSubcommand,
     TxSubcommand, UpdateSubcommand,
 };
-use crate::domain::{AppResult, ProjectRoot};
+use crate::dependency_sync::UvClient;
+use crate::domain::{AppError, AppResult, OpId, ProjectRoot};
+use crate::safety_guards;
+use crate::toml_support::{self, RuntimeConfig};
 
 pub fn dispatch(cli: Cli) -> AppResult<()> {
     let root = ProjectRoot::discover()?;
@@ -69,5 +72,44 @@ pub fn dispatch(cli: Cli) -> AppResult<()> {
         Commands::Run(args) => runtime::cmd_run(args, &root),
         Commands::Stop => runtime::cmd_stop(&root),
         Commands::Status => status::cmd_status(&root),
+    }
+}
+
+fn configured_uv(root: &ProjectRoot) -> AppResult<(RuntimeConfig, UvClient)> {
+    let config = toml_support::read_config(&root.config_toml())?
+        .ok_or_else(|| AppError::usage("config.toml is required"))?;
+    let python = config
+        .runtime
+        .python
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| AppError::usage("config.toml is missing runtime.python"))?;
+    let uv = UvClient::new(python);
+    Ok((config, uv))
+}
+
+fn rollback_failed_operation(
+    root: &ProjectRoot,
+    op_id: &OpId,
+    config: &RuntimeConfig,
+    uv: &UvClient,
+    error: anyhow::Error,
+) -> AppError {
+    let mut note = format!("{error:#}");
+    let rollback = safety_guards::op_restore(op_id, root).and_then(|_| uv.sync_prod(root, config));
+    if let Err(error) = rollback {
+        note.push_str(&format!("; rollback failed: {error:#}"));
+    }
+    if let Err(error) = safety_guards::op_finalize(op_id, false, Some(note.clone()), root) {
+        note.push_str(&format!("; failed to record operation failure: {error:#}"));
+    }
+    AppError::runtime(note)
+}
+
+fn prune_history(root: &ProjectRoot, config: &RuntimeConfig) {
+    if let Err(error) =
+        crate::state_ledger::prune_operations(root, config.ops.retention_count.unwrap_or(100))
+    {
+        eprintln!("warning: failed to prune operation history: {error:#}");
     }
 }

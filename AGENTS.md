@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`comfy_env` is a sidecar governance CLI for ComfyUI custom-node dependency changes. Optimize for correctness, auditability, and rollback safety over speed; a broken venv is worse than a slow command. All production dependency mutations must go through a candidate transaction before promotion.
+`comfy_env` is a sidecar governance CLI for ComfyUI custom-node dependency changes. Optimize for correctness, auditability, and rollback safety over speed; a broken venv is worse than a slow command. Stage and lock dependency changes before promotion. Plugin and core update transactions also observe a candidate environment.
 
 The CLI is implemented in **Rust** as a single binary `gov`. Target platforms: **Linux + Windows**.
 
@@ -77,7 +77,7 @@ Use this section to record commands that should be run with escalation immediate
 
 Vertical slice migration — each slice delivers a complete command group:
 
-- [ ] Slice 1: `pin add` / `pin list` / `pin remove` / `undo` / `op list` / `op inspect`
+- [x] Slice 1 (implemented): `pin add` / `pin list` / `pin remove` / `undo` / `op list` / `op inspect`
 - [ ] Slice 2: `install torch` / `install` / `status`
 - [ ] Slice 3: `node add` / `node remove` / `tx run` / `tx inspect` / `tx abort` / `tx promote` / `resolve`
 - [ ] Slice 4: `update run` / `update inspect` / `update abort` / `update promote` / `update resolve`

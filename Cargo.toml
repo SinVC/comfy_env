@@ -13,10 +13,13 @@ anyhow = "1.0.100"
 clap = { version = "4.5.39", features = ["derive"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+getrandom = "0.4"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 sha2 = "0.10.9"
 tempfile = "3.20.0"
 thiserror = "2.0.17"
 toml_edit = { version = "0.22.27", features = ["serde"] }
+wait-timeout = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2.0.17"

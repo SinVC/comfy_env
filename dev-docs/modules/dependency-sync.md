@@ -15,9 +15,10 @@ Wraps all `uv` invocations. Never called directly by application code — always
 ```rust
 struct UvClient {
     python: String,        // configured Python minor line
-    cache_dir: PathBuf,    // cache/uv
 }
 ```
+
+Use uv's configured cache. The CLI does not create or prune a second cache.
 
 #### Lock
 
@@ -39,7 +40,7 @@ Used by `env import` to verify bundle integrity.
 ```rust
 fn sync(&self, project_dir: &Path, env_path: &Path) -> Result<CmdResult>
 ```
-Runs: `UV_PROJECT_ENVIRONMENT=<env_path> uv sync --python <python> --locked --exact --all-groups` in `project_dir`.
+Runs: `UV_PROJECT_ENVIRONMENT=<env_path> uv sync --python <python> --locked --all-groups` in `project_dir`.
 
 Platform note: `env_path` must be a **platform-native absolute path** (with backslashes on Windows). `uv` expects native paths in environment variables — do not normalize to forward slashes here.
 
@@ -91,8 +92,8 @@ fn create_staged_workdir(root: &Path, work_base: &Path) -> Result<StagedWorkdir>
 ```
 
 1. Create temp directory under `work_base`
-2. Copy `pyproject.toml` and `uv.lock` from `root` into workdir
-3. Return handle with path
+2. Copy `pyproject.toml` and `uv.lock` from `root` into workdir. For a local flat wheel index, preserve the directory referenced by a relative `package.source.registry` when moving the lock in either direction.
+3. Return a handle owning the workdir. Resolve relative `UV_FIND_LINKS` entries from the project root when locking the staged copy.
 
 ```rust
 fn promote_workdir(workdir: &StagedWorkdir, root: &Path) -> Result<()>
@@ -103,11 +104,11 @@ Copy workdir's `pyproject.toml` and `uv.lock` back to root (via atomic writes).
 ### 3. Prod Sync Protocol
 
 ```rust
-fn sync_prod(root: &Path, config: &RuntimeConfig) -> Result<CmdResult>
+fn sync_prod(&self, root: &ProjectRoot, config: &RuntimeConfig) -> Result<()>
 ```
 
 1. Determine prod env path: `<root>/<config.runtime.prod_env>`
-2. Call `UvClient::sync(root, prod_env_path)`
+2. Call `UvClient::sync(root, prod_env_path)`. Surface spawn errors and nonzero exit codes to the caller, including when resyncing a restored project.
 
 ### 4. Lock Conflict Detection
 

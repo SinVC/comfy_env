@@ -2,14 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339, macros::format_description};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{OpId, OpStatus, ProjectRoot, TxStatus};
-use crate::platform;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PluginRecord {
@@ -21,7 +20,7 @@ pub struct PluginRecord {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TransactionRecord {
-    #[serde(default)]
+    #[serde(default, alias = "txid")]
     pub id: String,
     #[serde(default)]
     pub kind: String,
@@ -29,9 +28,9 @@ pub struct TransactionRecord {
     pub status: Option<TxStatus>,
     #[serde(default)]
     pub subject: String,
-    #[serde(default)]
+    #[serde(default, alias = "started_at")]
     pub created_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "ended_at")]
     pub updated_at: Option<String>,
 }
 
@@ -39,17 +38,20 @@ impl TransactionRecord {
     pub fn sort_key(&self) -> Option<&str> {
         self.updated_at
             .as_deref()
+            .filter(|value| !value.is_empty())
             .or(self.created_at.as_deref())
             .or(Some(self.id.as_str()))
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpKind {
     PinAdd,
     PinRemove,
     ManualUndo,
+    #[serde(untagged)]
+    Historical(String),
 }
 
 impl std::fmt::Display for OpKind {
@@ -58,6 +60,7 @@ impl std::fmt::Display for OpKind {
             Self::PinAdd => "pin_add",
             Self::PinRemove => "pin_remove",
             Self::ManualUndo => "manual_undo",
+            Self::Historical(kind) => kind,
         };
         f.write_str(value)
     }
@@ -75,6 +78,7 @@ pub struct TrackedFileHashes {
 pub struct OperationRecord {
     pub op_id: String,
     pub kind: OpKind,
+    #[serde(alias = "ref")]
     pub reference: String,
     pub status: OpStatus,
     pub started_at: String,
@@ -91,17 +95,15 @@ pub struct OperationRecord {
     pub undo_reference: Option<String>,
 }
 
-impl OperationRecord {
-    pub fn sort_key(&self) -> &str {
-        self.ended_at
-            .as_deref()
-            .or(Some(self.started_at.as_str()))
-            .unwrap_or(self.op_id.as_str())
-    }
-
-    pub fn backup_dir_path(&self) -> PathBuf {
-        platform::from_state_path(&self.backup_dir)
-    }
+// Early Rust records used Unix seconds with a millisecond fraction and a Z suffix.
+fn operation_time(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value, &Rfc3339).ok().or_else(|| {
+        let (seconds, millis) = value.strip_suffix('Z')?.split_once('.')?;
+        OffsetDateTime::from_unix_timestamp(seconds.parse().ok()?)
+            .ok()?
+            .replace_millisecond(millis.parse().ok()?)
+            .ok()
+    })
 }
 
 pub fn load_plugins(root: &ProjectRoot) -> Result<Vec<PluginRecord>> {
@@ -125,7 +127,10 @@ pub fn load_transactions(root: &ProjectRoot) -> Result<Vec<TransactionRecord>> {
     for entry in fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))? {
         let entry = entry.with_context(|| format!("failed to inspect {}", dir.display()))?;
         let path = entry.path();
-        if !matches!(path.extension().and_then(|value| value.to_str()), Some("json")) {
+        if !matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("json")
+        ) {
             continue;
         }
 
@@ -141,31 +146,34 @@ pub fn load_transactions(root: &ProjectRoot) -> Result<Vec<TransactionRecord>> {
 }
 
 pub fn next_op_id() -> Result<OpId> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| anyhow!("failed to read system time: {error}"))?;
-    let millis = duration.as_millis();
-    let suffix = ((duration.as_nanos() as u64) ^ (std::process::id() as u64)) as u32;
-    Ok(OpId(format!("{millis:013}-op-{suffix:08x}")))
-}
-
-pub fn create_operation(root: &ProjectRoot, op: &OperationRecord) -> Result<()> {
-    let path = op_meta_path(root, &OpId(op.op_id.clone()));
-    write_operation_path(&path, op)
+    let stamp = OffsetDateTime::now_utc().format(format_description!(
+        "[year][month][day]T[hour][minute][second]Z"
+    ))?;
+    let suffix =
+        getrandom::u32().map_err(|error| anyhow!("failed to generate operation ID: {error}"))?;
+    Ok(OpId(format!("{stamp}-op-{suffix:08x}")))
 }
 
 pub fn load_operation(root: &ProjectRoot, op_id: &OpId) -> Result<OperationRecord> {
+    ensure!(
+        Path::new(&op_id.0).file_name() == Some(std::ffi::OsStr::new(&op_id.0)),
+        "invalid operation ID"
+    );
     let path = op_meta_path(root, op_id);
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let record = serde_json::from_str::<OperationRecord>(&text)
         .with_context(|| format!("failed to parse {}", path.display()))?;
+    ensure!(
+        record.op_id == op_id.0,
+        "operation ID differs from its directory"
+    );
     Ok(record)
 }
 
 pub fn save_operation(root: &ProjectRoot, op: &OperationRecord) -> Result<()> {
-    let path = op_meta_path(root, &OpId(op.op_id.clone()));
-    write_operation_path(&path, op)
+    let path = root.ops_dir().join(&op.op_id).join("meta.json");
+    crate::fs_support::atomic_write(&path, &serde_json::to_vec_pretty(op)?)
 }
 
 pub fn list_operations(root: &ProjectRoot) -> Result<Vec<OperationRecord>> {
@@ -192,44 +200,46 @@ pub fn list_operations(root: &ProjectRoot) -> Result<Vec<OperationRecord>> {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let record = serde_json::from_str::<OperationRecord>(&text)
             .with_context(|| format!("failed to parse {}", path.display()))?;
+        ensure!(
+            entry.file_name() == std::ffi::OsStr::new(&record.op_id),
+            "operation ID differs from its directory: {}",
+            path.display()
+        );
         operations.push(record);
     }
 
-    operations.sort_by(|left, right| right.sort_key().cmp(left.sort_key()));
+    operations.sort_by_cached_key(|op| std::cmp::Reverse(operation_time(&op.started_at)));
     Ok(operations)
+}
+
+pub fn prune_operations(root: &ProjectRoot, retention_count: usize) -> Result<()> {
+    let completed = list_operations(root)?
+        .into_iter()
+        .filter(|op| op.status != OpStatus::Running);
+    for op in completed.skip(retention_count.max(1)) {
+        let directory = root.ops_dir().join(op.op_id);
+        fs::remove_dir_all(&directory)
+            .with_context(|| format!("failed to prune {}", directory.display()))?;
+    }
+    Ok(())
 }
 
 pub fn mark_operation_undone(
     root: &ProjectRoot,
-    op_id: &OpId,
+    record: &mut OperationRecord,
     undo_reference: &OpId,
 ) -> Result<()> {
-    let mut record = load_operation(root, op_id)?;
-    if record.status != OpStatus::Success {
-        bail!("operation {} is not successful", op_id.0);
-    }
     record.status = OpStatus::Undone;
+    record.undoable = false;
     record.ended_at = Some(now_string()?);
     record.undo_reference = Some(undo_reference.0.clone());
-    save_operation(root, &record)
+    save_operation(root, record)
 }
 
 pub fn now_string() -> Result<String> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| anyhow!("failed to read system time: {error}"))?;
-    Ok(format!(
-        "{}.{:03}Z",
-        duration.as_secs(),
-        duration.subsec_millis()
-    ))
+    Ok(OffsetDateTime::now_utc().format(&Rfc3339)?)
 }
 
 fn op_meta_path(root: &ProjectRoot, op_id: &OpId) -> PathBuf {
     root.ops_dir().join(&op_id.0).join("meta.json")
-}
-
-fn write_operation_path(path: &PathBuf, op: &OperationRecord) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(op)?;
-    crate::fs_support::atomic_write(path, &bytes)
 }

@@ -43,11 +43,9 @@ Install PyTorch family packages into the `dependency-groups.torch` group with a 
 
 ```
 1. Derive index name from URL (e.g., "pytorch-cu121" from URL pattern)
-2. op_begin(kind="install_torch")
-3. For each torch family package (torch, torchvision, torchaudio):
-   - If explicit spec provided: `uv add --group torch --python <py> --no-sync <spec> --index <name>=<url>`
-   - Else: `uv add --group torch --python <py> --no-sync <package> --index <name>=<url>`
-4. Lock project: `uv lock --python <py>`
+2. Copy truth into a temporary workdir.
+3. Add the three selected torch specs together, binding them to the requested named index in the staged project.
+4. Lock the staged project once, then start the install_torch operation and promote its truth.
 5. Sync prod env via [Prod Sync Protocol]
 6. Smoke test: import torch, torchvision, torchaudio in prod env Python
 7. op_finalize(success)
@@ -56,8 +54,7 @@ Install PyTorch family packages into the `dependency-groups.torch` group with a 
 ### Failure Path
 
 ```
-IF uv add fails: op_restore → re-sync prod → op_finalize(failed)
-IF uv lock fails: op_restore → re-sync prod → op_finalize(failed)
+IF staging or lock fails: discard the workdir before touching production.
 IF uv sync fails: op_restore → re-sync prod → op_finalize(failed)
 IF smoke test fails: op_restore → re-sync prod → op_finalize(failed)
 ```
@@ -110,11 +107,10 @@ Import ComfyUI core requirements into `dependency-groups.core`. Filters out torc
 ```
 1. Read requirements file
 2. Filter out torch family packages (torch, torchvision, torchaudio)
-3. op_begin(kind="install_core")
-4. Clear existing core group entries
-5. For each remaining requirement:
-   `uv add --group core --python <py> --no-sync <spec>`
-6. Lock project: `uv lock --python <py>`
+3. Copy truth to a temporary workdir.
+4. Replace the staged core group once with all filtered requirements.
+5. Lock the workdir.
+6. Start the install_core operation and promote the staged truth.
 7. Sync prod env via [Prod Sync Protocol]
 8. Smoke test via [Smoke Test Protocol]
 9. op_finalize(success)
@@ -124,8 +120,8 @@ Import ComfyUI core requirements into `dependency-groups.core`. Filters out torc
 
 ```
 IF torch group not ready: exit with precondition error (no mutation)
-IF uv add fails: op_restore → re-sync prod → op_finalize(failed)
-IF lock/sync/smoke fails: op_restore → re-sync prod → op_finalize(failed)
+IF staging or lock fails: discard the workdir before touching production.
+IF promotion, sync or smoke fails: op_restore → re-sync prod → op_finalize(failed)
 ```
 
 ### Platform Notes

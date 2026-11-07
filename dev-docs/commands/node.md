@@ -66,7 +66,7 @@ Register a ComfyUI plugin by cloning its Git repository into `custom_nodes/`. Do
 
 ```
 IF duplicate node_id: exit with error (no mutation)
-IF git clone fails: clean up partial clone directory, exit
+IF the target already exists, preserve its contents. Clean up a partial clone only when this invocation created the directory.
 IF git checkout fails: clean up cloned directory, exit
 ```
 
@@ -119,13 +119,10 @@ Remove a plugin's dependency group from `pyproject.toml`, re-lock, sync prod, an
 
 ```
 1. Load plugin record from plugins.json
-2. op_begin(kind="node_remove", reference=node_id)
-3. Copy truth to staged workdir
-4. Remove dependency group from workdir pyproject.toml:
-   - Remove all packages: `uv remove --group <group> --frozen <pkg>` for each
-   - Remove the group section itself
-5. Lock workdir via [Staged Workdir Protocol]
-6. IF lock succeeds:
+2. Copy truth to a temporary workdir.
+3. Remove the plugin's group in one TOML edit and lock the workdir.
+4. After lock succeeds, start the node_remove operation. For --purge-code, include this plugin's source tree in its backup.
+5. Apply the removal:
    a. Copy workdir truth → root
    b. Sync prod env via [Prod Sync Protocol]
    c. Smoke test via [Smoke Test Protocol]
@@ -138,8 +135,8 @@ Remove a plugin's dependency group from `pyproject.toml`, re-lock, sync prod, an
 
 ```
 IF plugin not found: exit with error (no mutation)
-IF lock fails: op_restore → re-sync prod → op_finalize(failed)
-IF sync fails: op_restore → re-sync prod → op_finalize(failed)
+IF lock fails: discard the workdir before touching production.
+IF promotion, sync, purge or registry update fails: restore the backup, re-sync prod and record the failure.
 ```
 
 ### Platform Notes

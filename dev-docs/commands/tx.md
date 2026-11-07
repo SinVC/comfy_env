@@ -25,7 +25,7 @@ Create a candidate transaction that observes the dependency impact of a plugin. 
 
 - Plugin must exist in `plugins.json`
 - Plugin source directory must exist (`custom_nodes/<node_id>/`)
-- Plugin must have a `requirements.txt` in its source directory (`custom_nodes/<node_id>/requirements.txt`). If no requirements file exists, the plugin is treated as having no additional dependencies — the transaction proceeds with an empty dependency set for the plugin group.
+- A missing plugin requirements.txt contributes an empty dependency set.
 - `config.toml` must exist
 - No existing `running` transaction for this node (prevents duplicates)
 
@@ -53,10 +53,10 @@ Create a candidate transaction that observes the dependency impact of a plugin. 
 5. Copy truth files to staged workdir
 6. Add plugin requirements to workdir pyproject.toml:
    - Create/update dependency-groups.<group_name>
-   - `uv add --group <group> --python <py> --no-sync <spec>` for each dep
+   - Write the whole dependency group once.
 7. Lock workdir: `uv lock --python <py>`
 8. Create candidate env: sync workdir to .venv-candidate/<txid>/
-9. Capture pre-freeze: `uv pip freeze` in candidate env
+9. Capture pre_freeze from the current production environment as the comparison baseline.
 10. Run ComfyUI in candidate env:
     - Command: venv_python <comfyui_dir>/main.py
     - With timeout
@@ -79,9 +79,8 @@ IF plugin not found: exit with precondition error
 IF lock fails during workdir staging:
   - Write conflict artifact via [Lock Conflict Protocol]
   - Update tx status → "needs_resolution"
-  - Clean up candidate env
   - Return (not a fatal error — user resolves then re-promotes)
-IF candidate sync fails: update tx status → "failed", clean up
+IF candidate sync fails: mark failed, retain diagnostics and require a new successful candidate setup before promotion.
 IF ComfyUI run times out: record RunOutcome::TimedOut, preserve run_exit_code, status → "completed"
 IF ComfyUI run exits non-zero: record exit code, status → "failed"
 ```
@@ -164,7 +163,7 @@ Cancel a transaction and clean up its candidate environment.
 ### Preconditions
 
 - Transaction must exist
-- Transaction status must be one of: `completed`, `failed`, `needs_resolution`, `resolved`
+- Transaction status must be one of: `completed`, `failed`, `needs_resolution`, `resolved`, `promote_failed`
 - Cannot abort an already `promoted` or `aborted` transaction
 
 ### Reads
@@ -214,7 +213,7 @@ Promote a completed transaction's dependency changes into production truth and s
 ### Preconditions
 
 - Transaction must exist with status `completed`, `resolved`, or `failed`
-- If status is `failed`: `--allow-failed-run` is required
+- `--allow-failed-run` applies only to a recorded nonzero ComfyUI run after candidate setup succeeded. A failed sync has no runtime observation to approve.
 - Core impact gate: if core_impact non-empty, requires `--approve-core`
 
 ### Reads
@@ -237,27 +236,15 @@ Promote a completed transaction's dependency changes into production truth and s
 1. Load transaction record
 2. Verify status is promotable
 3. IF run was failed AND no --allow-failed-run: exit with policy error
-4. Execute [Core Impact Gate Protocol]
-5. Generate promotion plan:
-   - Classify additions as "direct" (from plugin requirements) or "override"
-6. op_begin(kind="plugin_promote", reference=txid)
-7. Copy truth to staged workdir
-8. Apply promotion plan to workdir:
-   - Add direct deps to plugin's dependency group
-   - Add override deps to overrides group (if any resolution pins exist)
-9. Lock workdir via [Staged Workdir Protocol]
-10. IF lock fails:
-    - Execute [Lock Conflict Protocol]
-    - Update tx status → "needs_resolution"
-    - op_restore → op_finalize(failed)
-    - Return conflict state
-11. Copy workdir truth → root (pyproject.toml, uv.lock)
-12. Sync prod env via [Prod Sync Protocol]
-13. Smoke test via [Smoke Test Protocol]
-14. Update transaction: status → "promoted", promotion.op_id = op_id
-15. Update plugins.json: set managed_deps for plugin
-16. op_finalize(success)
-17. IF `--keep-artifacts` is not set:
+4. Build the promotion plan from the plugin requirements, observed additions and resolution pins.
+5. Apply that plan once to a fresh staging copy of the current production truth.
+6. Lock the workdir. On conflict, store the conflict and mark the transaction needs_resolution.
+7. Compare the resolved changes to current prod and apply the core impact gate to the plan being promoted.
+8. op_begin(kind="plugin_promote", reference=txid)
+9. Copy workdir truth → root (pyproject.toml, uv.lock)
+10. Sync prod via [Prod Sync Protocol] and run the smoke command.
+11. Update managed_deps in plugins.json, finalize the operation and record the promotion op_id on the transaction.
+12. IF `--keep-artifacts` is not set:
     - Clean up candidate env and staged workdir
     - If cleanup fails, emit warning only; do not change promote success
 ```
@@ -266,7 +253,7 @@ Promote a completed transaction's dependency changes into production truth and s
 
 ```
 IF policy gate blocks: exit before mutation
-IF lock conflict: set needs_resolution, op_restore, return conflict
+IF staging lock conflicts: set needs_resolution and return before the production checkpoint
 IF sync fails: op_restore → re-sync prod → op_finalize(failed)
     → tx status → "promote_failed"
 IF smoke fails: op_restore → re-sync prod → op_finalize(failed)
@@ -275,5 +262,5 @@ IF smoke fails: op_restore → re-sync prod → op_finalize(failed)
 
 ### State Transitions
 
-- Transaction: `completed`/`resolved` → `promoted` | `needs_resolution` | `promote_failed`
+- Successful, resolved and explicitly approved failed runtime observations may transition to `promoted`, `needs_resolution` or `promote_failed`.
 - Operation: created `running` → `success` | `failed`

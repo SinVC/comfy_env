@@ -41,7 +41,6 @@ fn copy_dir(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()>
 Recursively copies `src` to `dst`, skipping directories whose names match any entry in `exclude`.
 
 **Contract**: Used for:
-- Staged workdir creation (copy truth files)
 - Bundle export (copy custom_nodes, exclude `.git`)
 - Backup creation (copy affected directories)
 
@@ -55,7 +54,7 @@ fn remove_dir_all(path: &Path) -> Result<()>
 
 Removes directory and all contents. Platform-specific handling:
 - Windows: clear read-only attributes before deletion (Git sets some files read-only)
-- Uses standard recursive deletion; no special symlink/junction detection needed — `custom_nodes/` directories managed by `gov` are always regular directories created by `git clone`
+- When reconciling an existing custom_nodes tree, skip linked directories and warn as specified in ADR-003; traversal must stay inside the tree.
 
 ### 5. Temporary Workdir
 
@@ -63,7 +62,7 @@ Removes directory and all contents. Platform-specific handling:
 fn create_workdir(base: &Path) -> Result<TempWorkdir>
 ```
 
-Creates a temporary directory under `base` (typically `state/work/`). Returns a handle that provides the path. Cleanup is explicit (caller decides when to delete).
+Creates a temporary directory under `base` (typically `state/work/`). Returns a handle that provides the path. Pin commands own a `TempDir` until they return. A transaction that spans CLI invocations explicitly keeps its workdir and records its path for promote or abort.
 
 **Contract**: Workdirs are used for staged mutations — they hold copies of truth files that get mutated, locked, and tested before being promoted to root.
 

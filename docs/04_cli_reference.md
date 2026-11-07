@@ -1,6 +1,6 @@
 # 04 CLI 命令参考
 
-> 以下为 `comfy_env/bin/gov` 当前实现语义（Batch-4）。
+> 本文记录 Bash 版 `bin/gov` 的命令行为（Batch-4）。Rust 分支的可用命令见 [README](../README.md)，pin、审计及撤销的当前契约见 [pin](../dev-docs/commands/pin.md) 和 [ops](../dev-docs/commands/ops.md)。
 
 ## 1. 首装与核心依赖
 

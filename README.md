@@ -1,18 +1,13 @@
 # Comfy Environment Governance (`comfy_env`)
 
-ComfyUI 依赖治理系统。
-完全切换到切换到的高速UV并且具备更好缓存策略的依赖管理，同时并且不破坏项目本体pyptoject.toml避免每次git时候的合并操作。支持本体和插件的依赖事务管理，可以精确回滚，保证不炸环境。放心升级和折腾，
-现在同时覆盖两类依赖面：
+当前分支正在把 ComfyUI 依赖治理 CLI 迁移到 Rust。可用命令包括 `gov pin add/list/remove`、`gov op list/inspect`、`gov undo`、`gov status` 和 `gov help`。在侧车项目根目录运行这些命令。修改 pin 需要已有的 `config.toml`、`pyproject.toml` 和 `uv.lock`。其余命令仍在迁移中。
 
-1. 插件依赖：继续使用 `tx run -> tx promote -> undo`
-2. ComfyUI 本地核心依赖：使用 `init -> install torch -> install` 完成首装，后续使用 `update run -> update promote -> undo`
+编译使用 `cargo build --release`。Linux 的二进制文件为 `target/release/gov`，Windows 为 `target/release/gov.exe`。开发与审查从 [Rust 架构说明](dev-docs/architecture.md) 进入。[命令契约](dev-docs/commands/contracts.md) 给出每个命令的设计。
 
-面向AI使用和coding优化。
+## 迁移目标与完整工作流
 
-## 0. 如果你是 AI
+以下章节描述完整迁移后的命令和目录结构。`bin/gov` 是保留的 Bash 行为参考。
 
-1. 开发或审计时，阅读 `dev-docs/architecture-haiku.md`，把它当作唯一入口导航。
-2. 使用时，阅读：`docs/04_cli_reference.md`
 ## 1. 项目目标
 
 1. 可复现：本地 `pyproject.toml + uv.lock` 可重建依赖环境。
@@ -22,29 +17,29 @@ ComfyUI 依赖治理系统。
 
 ## 2. 命令总览
 
-1. `./bin/gov init --comfyui-dir <abs-path> --python <python-spec>`
-2. `./bin/gov install torch --index-url <url>`
-3. `./bin/gov install [--requirements-file <path>]`
-4. `./bin/gov update run [--requirements-file <path>] [--timeout <seconds>]`
-5. `./bin/gov update inspect <txid>`
-6. `./bin/gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]`
-7. `./bin/gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
-8. `./bin/gov update abort <txid>`
-9. `./bin/gov env export <output_dir>`
-10. `./bin/gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>`
-11. `./bin/gov status`
-12. `./bin/gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]`
-13. `./bin/gov node remove <node_id> [--purge-code]`
-14. `./bin/gov tx run <node_id> [--timeout <seconds>]`
-15. `./bin/gov tx inspect <txid>`
-16. `./bin/gov tx abort <txid>`
-17. `./bin/gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
-18. `./bin/gov resolve <txid>`
-19. `./bin/gov op list`
-20. `./bin/gov op inspect <op_id>`
-21. `./bin/gov undo <op_id>`
-22. `./bin/gov run [--sync] [-- <args...>]`
-23. `./bin/gov stop`
+1. `gov init --comfyui-dir <abs-path> --python <python-spec>`
+2. `gov install torch --index-url <url>`
+3. `gov install [--requirements-file <path>]`
+4. `gov update run [--requirements-file <path>] [--timeout <seconds>]`
+5. `gov update inspect <txid>`
+6. `gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]`
+7. `gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
+8. `gov update abort <txid>`
+9. `gov env export <output_dir>`
+10. `gov env import <bundle_dir> --comfyui-dir <abs-path> --python <python-spec>`
+11. `gov status`
+12. `gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]`
+13. `gov node remove <node_id> [--purge-code]`
+14. `gov tx run <node_id> [--timeout <seconds>]`
+15. `gov tx inspect <txid>`
+16. `gov tx abort <txid>`
+17. `gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
+18. `gov resolve <txid>`
+19. `gov op list`
+20. `gov op inspect <op_id>`
+21. `gov undo <op_id>`
+22. `gov run [--sync] [-- <args...>]`
+23. `gov stop`
 
 ## 3. 目录结构（侧车模式）
 
@@ -55,7 +50,7 @@ TopDir/
 │   ├── requirements.txt
 │   └── custom_nodes/
 └── comfy_env/
-    ├── bin/gov
+    ├── gov                     # Windows 为 gov.exe
     ├── config.toml.template
     ├── pyproject.toml.template
     ├── config.toml
@@ -77,9 +72,9 @@ TopDir/
 ## 4. 首次安装（新顺序）
 
 ```bash
-./bin/gov init --comfyui-dir /abs/path/to/ComfyUI --python 3.12
-./bin/gov install torch --index-url https://download.pytorch.org/whl/cu130
-./bin/gov install
+gov init --comfyui-dir /abs/path/to/ComfyUI --python 3.12
+gov install torch --index-url https://download.pytorch.org/whl/cu130
+gov install
 ```
 
 说明：
@@ -92,10 +87,10 @@ TopDir/
 ## 5. 后续升级（核心依赖事务）
 
 ```bash
-./bin/gov update run
-./bin/gov update inspect <txid>
-./bin/gov update resolve <txid> --pin pkg==1.2.3
-./bin/gov update promote <txid>
+gov update run
+gov update inspect <txid>
+gov update resolve <txid> --pin pkg==1.2.3
+gov update promote <txid>
 ```
 
 说明：
@@ -107,25 +102,25 @@ TopDir/
 ## 6. 插件事务（保持不变）
 
 ```bash
-./bin/gov node add <git_url> [--id <node_id>]
-./bin/gov tx run <node_id>
-./bin/gov tx inspect <txid>
-./bin/gov tx promote <txid>
+gov node add <git_url> [--id <node_id>]
+gov tx run <node_id>
+gov tx inspect <txid>
+gov tx promote <txid>
 ```
 
 冲突时：
 
 ```bash
-./bin/gov resolve <txid>
-./bin/gov tx promote <txid>
+gov resolve <txid>
+gov tx promote <txid>
 ```
 
 ## 7. 撤销与状态
 
 ```bash
-./bin/gov status
-./bin/gov op list
-./bin/gov undo <op_id>
+gov status
+gov op list
+gov undo <op_id>
 ```
 
 `status` 现在会额外显示：
@@ -140,8 +135,8 @@ TopDir/
 ## 8. 环境交付
 
 ```bash
-./bin/gov env export /abs/path/to/bundle-dir
-./bin/gov env import /abs/path/to/bundle-dir --comfyui-dir /abs/path/to/ComfyUI --python 3.12
+gov env export /abs/path/to/bundle-dir
+gov env import /abs/path/to/bundle-dir --comfyui-dir /abs/path/to/ComfyUI --python 3.12
 ```
 
 说明：
@@ -156,6 +151,6 @@ TopDir/
 
 ## 9. 文档导航
 
-1. `dev-docs/architecture-haiku.md`
+1. [Rust 架构说明](dev-docs/architecture.md)
 2. `docs/04_cli_reference.md`
 3. `docs/10_quick_start_for_llm.md`

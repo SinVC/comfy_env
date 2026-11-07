@@ -9,29 +9,56 @@ use crate::toml_support::{self, RuntimeConfig};
 
 pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
     let config = toml_support::read_config(&root.config_toml())?;
+    let project = toml_support::read_project(&root.pyproject_toml())?;
+    let torch: Vec<_> = toml_support::dependency_group(&project, "torch")?
+        .iter()
+        .map(|spec| toml_support::normalize_package_name(spec))
+        .collect();
+    let torch_ready = ["torch", "torchvision", "torchaudio"]
+        .iter()
+        .all(|name| torch.iter().any(|pkg| pkg == name));
+    let core_ready = !toml_support::dependency_group(&project, "core")?.is_empty();
+    let config_ready = config.as_ref().is_some_and(|cfg| {
+        cfg.paths
+            .comfyui_dir
+            .as_ref()
+            .is_some_and(|p| !p.as_os_str().is_empty())
+            && cfg
+                .runtime
+                .python
+                .as_deref()
+                .is_some_and(|py| !py.trim().is_empty())
+    });
     let plugins = state_ledger::load_plugins(root)?;
     let transactions = state_ledger::load_transactions(root)?;
     let runtime_pid = read_runtime_pid(root);
     let runtime_running = runtime_pid.is_some_and(platform::is_process_alive);
 
     println!("project_root: {}", root.as_path().display());
-    println!("config_ready: {}", config.is_some());
+    println!("config_ready: {config_ready}");
     println!("comfyui_dir: {}", config_comfyui_dir(config.as_ref()));
     println!("python: {}", config_python(config.as_ref()));
     println!(
         "prod_env_exists: {}",
         prod_env_exists(root, config.as_ref())
     );
-    println!("torch_ready: {}", group_ready(root, "torch"));
-    println!("core_ready: {}", group_ready(root, "core"));
+    println!("torch_ready: {torch_ready}");
+    println!("core_ready: {core_ready}");
+    println!("lock_exists: {}", root.uv_lock().is_file());
     println!("plugins_registered: {}", plugins.len());
     println!(
         "plugins_enabled: {}",
         plugins.iter().filter(|plugin| plugin.enabled).count()
     );
+    let pending = transactions.iter().filter(|tx| {
+        matches!(tx.status,
+        Some(status) if !matches!(status, TxStatus::Aborted | TxStatus::Promoted))
+    });
+    println!("transactions_total: {}", transactions.len());
+    println!("transactions_pending: {}", pending.clone().count());
     println!(
-        "transactions_pending: {}",
-        pending_transactions(&transactions)
+        "update_transactions_pending: {}",
+        pending.filter(|tx| tx.kind == "core_update").count()
     );
     println!("transactions_recent: {}", transactions.len().min(8));
     println!("runtime_running: {}", runtime_running);
@@ -72,24 +99,6 @@ fn prod_env_exists(root: &ProjectRoot, config: Option<&RuntimeConfig>) -> bool {
         .unwrap_or_else(|| root.prod_env_dir());
 
     relative.exists()
-}
-
-fn group_ready(root: &ProjectRoot, group: &str) -> bool {
-    toml_support::read_dependency_group(&root.pyproject_toml(), group)
-        .map(|items| !items.is_empty())
-        .unwrap_or(false)
-}
-
-fn pending_transactions(transactions: &[TransactionRecord]) -> usize {
-    transactions
-        .iter()
-        .filter(|tx| {
-            matches!(
-                tx.status,
-                Some(TxStatus::Running | TxStatus::NeedsResolution | TxStatus::Resolved)
-            )
-        })
-        .count()
 }
 
 fn describe_probe(result: anyhow::Result<CmdResult>) -> String {

@@ -36,7 +36,7 @@ Rewrite `comfy_env` as a **Rust single-binary CLI** targeting **Linux + Windows*
 1. **Single crate** to start. Module boundaries preserved, no workspace split until concrete need emerges.
 2. **Rust `gov` is the only entry point from the first release.** Unimplemented commands print an error and exit non-zero.
 3. **Vertical-slice migration.** Each slice delivers a complete command group. No horizontal "read commands first, write commands later" phasing.
-4. **Cross-platform process execution is infrastructure, not a late addition.** The process runner, timeout, venv Python locator, and log capture must exist before any command that calls `uv`, `git`, or Python — meaning Slice 1.
+4. Implement platform behavior with its first consumer. Pin needs a venv Python locator and a bounded smoke command. Candidate runs add live log capture, and run/stop add runtime process management.
 5. **State file schema compatibility.** Existing schemas preserved. New fields are append-only and optional.
 6. **External tool boundary unchanged.** `uv`, `git`, and Python remain external CLI calls.
 7. **Command surface stable.** `init`, `install`, `pin`, `node`, `tx`, `update`, `env`, `op`, `undo`, `run`, `stop`, `help` — no renames.
@@ -155,7 +155,7 @@ All clients use the platform-abstracted process runner (see §Platform Abstracti
 
 ## Platform Abstraction
 
-Cross-platform concerns are **infrastructure that must exist before Slice 1**, not features deferred to later slices. The `platform/` module owns all platform-divergent behavior.
+The platform module owns behavior that differs between systems. Add capabilities in the slice that uses them.
 
 ### Venv Python Locator
 
@@ -328,19 +328,9 @@ Not needed: `uuid` (timestamp + random hex format is sufficient).
 
 ### Slice 0: Scaffold and Cross-Platform Infrastructure
 
-Before any command is implemented, the following must exist and be tested:
+Start with the CLI surface, config and truth-file reads, platform paths and subprocess probes used by status. Unimplemented commands return a named error. Add the ledger and backup operations with pin/undo, log streaming with candidate runs, and directory snapshots with the first command that restores them.
 
-- `platform/` module: venv Python locator, process runner with timeout, PID check, termination
-- `fs_support/` module: atomic write, SHA256, path normalization, dir copy
-- `toml_support/` module: config.toml reader/writer, pyproject.toml reader/editor
-- `state_ledger/` module: JSON read/write for plugins, transactions, operations, conflicts
-- `safety_guards/` module: backup/restore primitives, hash guard
-- `dependency_sync/` module: `UvClient` wrapper
-- `source_integration/` module: `GitClient` wrapper
-- `cli.rs`: clap definitions for all commands, unimplemented ones return `error: command '<name>' is not yet implemented`
-- Logging thin abstraction
-
-**Completion criteria**: `cargo test` passes on both Linux and Windows. `gov help` works. All other commands print "not yet implemented".
+**Completion criteria**: help and read-only status run on the target platforms. Pending command groups return their migration error.
 
 ### Slice 1: `pin add` / `pin list` / `pin remove` / `undo` / `op list` / `op inspect`
 

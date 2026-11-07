@@ -31,18 +31,18 @@ Nothing.
 
 ```
 1. Check config readiness:
-   - config.toml exists? → config_ready
-   - paths.comfyui_dir set and valid?
+   - config_ready requires both a configured ComfyUI path and a Python selector
+   - Report the configured ComfyUI path.
    - runtime.python set?
 2. Check environment readiness:
    - .venv-prod/ exists? → prod_env_exists
-   - dependency-groups.torch populated? → torch_ready
+   - torch, torchvision and torchaudio declared in the torch group? → torch_ready
    - dependency-groups.core populated? → core_ready
 3. Report plugin status:
    - Number of registered plugins
    - Number of enabled plugins
 4. Report transaction status:
-   - Count by status (pending, completed, failed, needs_resolution)
+   - Count by status. Pending includes all recorded states except promoted and aborted; report core_update pending separately.
    - List last 8 transactions (txid, kind, status, subject, timestamp)
 5. Report running status:
    - PID file exists? Process alive?

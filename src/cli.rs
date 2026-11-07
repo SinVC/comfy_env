@@ -57,7 +57,13 @@ pub enum InstallSubcommand {
 #[derive(Debug, Args)]
 pub struct InstallTorchArgs {
     #[arg(long)]
-    pub index_url: Option<String>,
+    pub index_url: String,
+    #[arg(long)]
+    pub torch: Option<String>,
+    #[arg(long)]
+    pub torchvision: Option<String>,
+    #[arg(long)]
+    pub torchaudio: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -94,7 +100,7 @@ pub enum NodeSubcommand {
 #[derive(Debug, Args)]
 pub struct NodeAddArgs {
     pub git_url: String,
-    #[arg(long)]
+    #[arg(long = "ref")]
     pub ref_name: Option<String>,
     #[arg(long)]
     pub id: Option<String>,
@@ -142,6 +148,8 @@ pub struct TxPromoteArgs {
     pub reason: Option<String>,
     #[arg(long)]
     pub allow_failed_run: bool,
+    #[arg(long)]
+    pub keep_artifacts: bool,
 }
 
 #[derive(Debug, Args)]
@@ -181,6 +189,8 @@ pub struct UpdatePromoteArgs {
     pub reason: Option<String>,
     #[arg(long)]
     pub allow_failed_run: bool,
+    #[arg(long)]
+    pub keep_artifacts: bool,
 }
 
 #[derive(Debug, Args)]

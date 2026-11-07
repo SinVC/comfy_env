@@ -191,6 +191,9 @@ impl CmdResult {
     }
 
     pub fn summary_line(&self) -> String {
+        if !self.success && !self.stderr.is_empty() {
+            return self.stderr.clone();
+        }
         let preferred = if self.stdout.is_empty() {
             self.stderr.as_str()
         } else {

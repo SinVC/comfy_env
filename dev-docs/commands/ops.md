@@ -126,8 +126,7 @@ Revert a successful operation by restoring from its backup. Creates a new operat
 6. Sync prod env via [Prod Sync Protocol]
 7. IF original operation backed up custom_nodes:
    - Restore custom_nodes from backup
-8. Mark target operation: status → "undone"
-9. op_finalize(success) for the new undo operation
+8. Finalize the new undo operation, then mark the target undone, clear its undoable flag and store the undo reference.
 ```
 
 ### Failure Path
@@ -136,8 +135,7 @@ Revert a successful operation by restoring from its backup. Creates a new operat
 IF op not found: exit with error
 IF op not undoable or not success: exit with error
 IF hash drift detected: exit with error (list mismatched files)
-IF restore fails: op_restore on the undo operation → op_finalize(failed)
-IF prod sync fails after restore: op_restore → op_finalize(failed)
+IF restore, prod sync or ledger update fails: restore the undo operation's backup, re-sync prod and finalize the undo operation as failed. Include any recovery failure in its note.
 ```
 
 ### State Transitions
