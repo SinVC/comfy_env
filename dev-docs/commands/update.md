@@ -135,7 +135,7 @@ At least one of `--pin` or `--pins-file` must be provided.
 3. Collect pins from --pin flags and/or --pins-file
 4. Merge new pins into transaction's resolution_pins (append, last-wins dedup)
 5. Open the retained staged workdir from update run.
-6. Apply the merged pins to the staged overrides array. Use the core requirements already staged by this transaction.
+6. Apply the merged pins to the staged overrides group and `tool.uv.override-dependencies` array so uv can override conflicting requirements. Use the core requirements already staged by this transaction.
 7. Lock workdir: `uv lock --python <py>`
 8. IF lock succeeds:
    - Sync the resulting candidate, observe it and refresh diff/core_impact before marking it resolved. Record setup or runtime failure as failed.

@@ -72,6 +72,14 @@ pub struct TransactionRecord {
     pub observed_requirements: Vec<String>,
     #[serde(default)]
     pub candidate_ready: bool,
+    #[serde(default)]
+    pub base_truth_sha256: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub staged_truth_sha256: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub source_requirements_path: Option<String>,
+    #[serde(default)]
+    pub source_requirements_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -133,6 +141,7 @@ pub enum OpKind {
     PinRemove,
     NodeRemove,
     PluginPromote,
+    CorePromote,
     ManualUndo,
     #[serde(untagged)]
     Historical(String),
@@ -147,6 +156,7 @@ impl std::fmt::Display for OpKind {
             Self::PinRemove => "pin_remove",
             Self::NodeRemove => "node_remove",
             Self::PluginPromote => "plugin_promote",
+            Self::CorePromote => "core_promote",
             Self::ManualUndo => "manual_undo",
             Self::Historical(kind) => kind,
         };
@@ -254,12 +264,16 @@ pub fn write_conflict(root: &ProjectRoot, tx: &TransactionRecord, raw: &str) -> 
     crate::fs_support::atomic_write(&log, raw.as_bytes())?;
     let report = ConflictReport {
         txid: tx.id.clone(),
-        node_id: tx.node_id.clone().unwrap_or_default(),
+        node_id: tx.node_id.clone().unwrap_or_else(|| tx.subject.clone()),
         created_at: now_string()?,
         raw_log: crate::platform::to_state_path(&log),
         summary: raw.lines().take(40).collect::<Vec<_>>().join("\n"),
         detected_packages: detect_conflict_packages(raw),
-        input_hint: format!("Use: gov resolve {} --pin pkg==version", tx.id),
+        input_hint: if tx.kind == "core_update" {
+            format!("Use: gov update resolve {} --pin pkg==version", tx.id)
+        } else {
+            format!("Use: gov resolve {} --pin pkg==version", tx.id)
+        },
     };
     let path = dir.join(format!("{}.json", tx.id));
     crate::fs_support::atomic_write(&path, &serde_json::to_vec_pretty(&report)?)?;

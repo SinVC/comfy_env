@@ -220,6 +220,37 @@ pub fn rewrite_dependency_group(
     Ok(())
 }
 
+pub fn upsert_uv_overrides(path: &Path, pins: &[String]) -> crate::domain::AppResult<()> {
+    let mut doc = read_project(path)?;
+    let tool = doc
+        .as_table_mut()
+        .entry("tool")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_like_mut()
+        .context("tool must be a table")?;
+    let uv = tool
+        .entry("uv")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_like_mut()
+        .context("tool.uv must be a table")?;
+    let overrides = uv
+        .entry("override-dependencies")
+        .or_insert(value(Array::new()))
+        .as_array_mut()
+        .context("tool.uv.override-dependencies must be an array")?;
+    let names: HashSet<_> = pins.iter().map(|pin| normalize_package_name(pin)).collect();
+    overrides.retain(|entry| {
+        !entry
+            .as_str()
+            .is_some_and(|spec| names.contains(&normalize_package_name(spec)))
+    });
+    for pin in pins {
+        overrides.push(pin.as_str());
+    }
+    crate::fs_support::atomic_write(path, doc.to_string().as_bytes())?;
+    Ok(())
+}
+
 pub fn remove_dependency_group(path: &Path, group: &str) -> Result<()> {
     let mut doc = read_project(path)?;
     if let Some(groups) = doc

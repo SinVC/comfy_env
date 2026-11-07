@@ -121,11 +121,16 @@ pub fn create_staged_workdir(root: &ProjectRoot) -> Result<StagedWorkdir> {
 }
 
 pub fn promote_workdir(workdir: &StagedWorkdir, root: &ProjectRoot) -> Result<()> {
-    let pyproject = std::fs::read(workdir.pyproject_toml())
-        .with_context(|| format!("failed to read {}", workdir.pyproject_toml().display()))?;
+    promote_staged_path(workdir.path(), root)
+}
+
+pub fn promote_staged_path(workdir: &Path, root: &ProjectRoot) -> Result<()> {
+    let staged_project = workdir.join("pyproject.toml");
+    let pyproject = std::fs::read(&staged_project)
+        .with_context(|| format!("failed to read {}", staged_project.display()))?;
     crate::fs_support::atomic_write(&root.pyproject_toml(), &pyproject)?;
 
-    copy_lock(workdir.path(), root.as_path())
+    copy_lock(workdir, root.as_path())
 }
 
 // uv records local flat-index directories relative to the lockfile. Keep the

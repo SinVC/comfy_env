@@ -108,7 +108,7 @@ pub fn cmd_install_torch(args: InstallTorchArgs, root: &ProjectRoot) -> AppResul
     Ok(())
 }
 
-fn read_core_requirements(path: &Path) -> AppResult<Vec<String>> {
+pub(crate) fn read_core_requirements(path: &Path) -> AppResult<Vec<String>> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("failed to read requirements file {}", path.display()))?;
     let mut specs = Vec::new();
