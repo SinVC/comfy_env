@@ -101,7 +101,56 @@ pub fn op_restore(op_id: &OpId, root: &ProjectRoot) -> Result<()> {
         crate::fs_support::restore_with_marker(&backup, &path, &marker)?;
     }
 
+    let source_path_file = backup_dir.join("custom_node.path");
+    if source_path_file.exists() {
+        let target = crate::platform::from_state_path(&std::fs::read_to_string(&source_path_file)?);
+        crate::source_integration::remove_plugin_source(&target)?;
+        let exists =
+            crate::fs_support::read_text_if_exists(&backup_dir.join("custom_node.exists"))?
+                .unwrap_or_else(|| "1".to_string());
+        match exists.trim() {
+            "1" => crate::source_integration::copy_plugin_source(
+                &backup_dir.join("custom_node"),
+                &target,
+            )?,
+            "0" => {}
+            other => anyhow::bail!("invalid custom node existence marker: {other}"),
+        }
+    }
+
     Ok(())
+}
+
+pub fn backup_custom_node(op_id: &OpId, source: &Path, root: &ProjectRoot) -> Result<()> {
+    let backup = root.ops_dir().join(&op_id.0).join("backup");
+    crate::source_integration::copy_plugin_source(source, &backup.join("custom_node"))?;
+    crate::fs_support::atomic_write(
+        &backup.join("custom_node.path"),
+        crate::platform::to_state_path(source).as_bytes(),
+    )
+}
+
+pub fn backup_undo_custom_node(undo_id: &OpId, target_id: &OpId, root: &ProjectRoot) -> Result<()> {
+    let original = root
+        .ops_dir()
+        .join(&target_id.0)
+        .join("backup")
+        .join("custom_node.path");
+    if !original.exists() {
+        return Ok(());
+    }
+    let source = crate::platform::from_state_path(&std::fs::read_to_string(&original)?);
+    let backup = root.ops_dir().join(&undo_id.0).join("backup");
+    if source.exists() {
+        crate::source_integration::copy_plugin_source(&source, &backup.join("custom_node"))?;
+        crate::fs_support::atomic_write(&backup.join("custom_node.exists"), b"1")?;
+    } else {
+        crate::fs_support::atomic_write(&backup.join("custom_node.exists"), b"0")?;
+    }
+    crate::fs_support::atomic_write(
+        &backup.join("custom_node.path"),
+        crate::platform::to_state_path(&source).as_bytes(),
+    )
 }
 
 pub fn check_undo_drift(record: &OperationRecord, root: &ProjectRoot) -> Result<DriftCheck> {

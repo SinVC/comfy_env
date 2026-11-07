@@ -14,13 +14,13 @@ fn status_reports_foundation_state() {
 }
 
 #[test]
-fn unimplemented_command_uses_exit_code_two() {
+fn node_add_requires_config() {
+    let workspace = tempfile::tempdir().expect("temporary workspace should be available");
     let mut command = Command::cargo_bin("gov").expect("gov binary should build");
     command
+        .current_dir(workspace.path())
         .args(["node", "add", "https://example.com/repo.git"])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains(
-            "error: command 'node add' is not yet implemented",
-        ));
+        .stderr(predicate::str::contains("error: config.toml is required"));
 }

@@ -22,6 +22,10 @@ impl StagedWorkdir {
     pub fn pyproject_toml(&self) -> PathBuf {
         self.path().join("pyproject.toml")
     }
+
+    pub fn persist(self) -> PathBuf {
+        self.dir.keep()
+    }
 }
 
 impl UvClient {
@@ -80,6 +84,29 @@ impl UvClient {
             result.summary_line()
         );
         Ok(())
+    }
+
+    pub fn pip_freeze(&self, env_path: &Path) -> Result<Vec<String>> {
+        if !env_path.exists() {
+            return Ok(Vec::new());
+        }
+        let result = run_uv(
+            uv_command()
+                .args(["pip", "freeze", "--python"])
+                .arg(crate::platform::venv_python(env_path)),
+        )?;
+        ensure!(
+            result.success,
+            "uv pip freeze failed: {}",
+            result.summary_line()
+        );
+        Ok(result
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
     }
 }
 

@@ -31,6 +31,7 @@ pub fn cmd_undo(args: UndoArgs, root: &ProjectRoot) -> AppResult<()> {
         safety_guards::op_begin(OpKind::ManualUndo, &format!("undo:{}", target_id.0), root)?;
 
     let undo_result = (|| -> anyhow::Result<()> {
+        safety_guards::backup_undo_custom_node(&undo_op, &target_id, root)?;
         safety_guards::op_restore(&target_id, root)?;
         uv.sync_prod(root, &config)
             .context("prod sync failed during undo")?;

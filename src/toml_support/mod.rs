@@ -15,6 +15,38 @@ pub struct RuntimeConfig {
     pub tx: TxConfig,
     #[serde(default)]
     pub ops: OpsConfig,
+    #[serde(default)]
+    pub policy: PolicyConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PolicyConfig {
+    #[serde(default = "default_core_packages")]
+    pub core_packages: Vec<String>,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            core_packages: default_core_packages(),
+        }
+    }
+}
+
+fn default_core_packages() -> Vec<String> {
+    [
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "xformers",
+        "triton",
+        "onnxruntime",
+        "onnxruntime-gpu",
+        "numpy",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -32,6 +64,7 @@ pub struct ConfigPaths {
 pub struct ConfigRuntime {
     pub python: Option<String>,
     pub prod_env: PathBuf,
+    pub candidate_root: PathBuf,
 }
 
 impl Default for ConfigRuntime {
@@ -39,6 +72,7 @@ impl Default for ConfigRuntime {
         Self {
             python: None,
             prod_env: ".venv-prod".into(),
+            candidate_root: ".venv-candidate".into(),
         }
     }
 }
@@ -184,6 +218,17 @@ pub fn rewrite_dependency_group(
 
     crate::fs_support::atomic_write(path, doc.to_string().as_bytes())?;
     Ok(())
+}
+
+pub fn remove_dependency_group(path: &Path, group: &str) -> Result<()> {
+    let mut doc = read_project(path)?;
+    if let Some(groups) = doc
+        .get_mut("dependency-groups")
+        .and_then(Item::as_table_like_mut)
+    {
+        groups.remove(group);
+    }
+    crate::fs_support::atomic_write(path, doc.to_string().as_bytes())
 }
 
 pub fn configure_torch_index(path: &Path, url: &str) -> Result<String> {

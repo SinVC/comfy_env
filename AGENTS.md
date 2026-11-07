@@ -79,7 +79,7 @@ Vertical slice migration — each slice delivers a complete command group:
 
 - [x] Slice 1 (implemented): `pin add` / `pin list` / `pin remove` / `undo` / `op list` / `op inspect`
 - [x] Slice 2 (implemented): `install torch` / `install` / `status`
-- [ ] Slice 3: `node add` / `node remove` / `tx run` / `tx inspect` / `tx abort` / `tx promote` / `resolve`
+- [x] Slice 3: `node add` / `node remove` / `tx run` / `tx inspect` / `tx abort` / `tx promote` / `resolve`
 - [ ] Slice 4: `update run` / `update inspect` / `update abort` / `update promote` / `update resolve`
 - [ ] Slice 5: `env export` / `env import`
 - [ ] Slice 6: `run` / `stop` / `help` / `init`

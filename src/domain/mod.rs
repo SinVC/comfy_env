@@ -52,6 +52,12 @@ impl From<anyhow::Error> for AppError {
     }
 }
 
+impl From<std::io::Error> for AppError {
+    fn from(value: std::io::Error) -> Self {
+        Self::runtime(value.to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectRoot {
     root: PathBuf,

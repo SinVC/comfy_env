@@ -8,19 +8,33 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339, macros::form
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{OpId, OpStatus, ProjectRoot, TxStatus};
+use crate::domain::{OpId, OpStatus, ProjectRoot, TxId, TxStatus};
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginRecord {
     #[serde(default)]
     pub id: String,
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub git_url: String,
+    #[serde(default, rename = "ref")]
+    pub git_ref: String,
+    #[serde(default)]
+    pub install_relpath: String,
+    #[serde(default)]
+    pub group: String,
+    #[serde(default)]
+    pub managed_deps: Vec<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TransactionRecord {
-    #[serde(default, alias = "txid")]
+    #[serde(default, rename = "txid", alias = "id")]
     pub id: String,
     #[serde(default)]
     pub kind: String,
@@ -28,10 +42,76 @@ pub struct TransactionRecord {
     pub status: Option<TxStatus>,
     #[serde(default)]
     pub subject: String,
-    #[serde(default, alias = "started_at")]
+    #[serde(default, rename = "started_at", alias = "created_at")]
     pub created_at: Option<String>,
-    #[serde(default, alias = "ended_at")]
+    #[serde(default, rename = "ended_at", alias = "updated_at")]
     pub updated_at: Option<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub candidate_env: String,
+    #[serde(default)]
+    pub staged_workdir: String,
+    #[serde(default)]
+    pub pre_freeze: Vec<String>,
+    #[serde(default)]
+    pub post_freeze: Vec<String>,
+    #[serde(default)]
+    pub diff: PackageDiff,
+    #[serde(default)]
+    pub core_impact: Vec<String>,
+    #[serde(default)]
+    pub logs: TransactionLogs,
+    #[serde(default)]
+    pub conflict_report: Option<String>,
+    #[serde(default)]
+    pub resolution_pins: Vec<String>,
+    #[serde(default)]
+    pub promotion: Option<PromotionRecord>,
+    #[serde(default)]
+    pub observed_requirements: Vec<String>,
+    #[serde(default)]
+    pub candidate_ready: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackageDiff {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TransactionLogs {
+    #[serde(default)]
+    pub stdout: String,
+    #[serde(default)]
+    pub stderr: String,
+    #[serde(default)]
+    pub run_exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromotionRecord {
+    pub status: TxStatus,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub op_id: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictReport {
+    pub txid: String,
+    pub node_id: String,
+    pub created_at: String,
+    pub raw_log: String,
+    pub summary: String,
+    pub detected_packages: Vec<String>,
+    pub input_hint: String,
 }
 
 impl TransactionRecord {
@@ -51,6 +131,8 @@ pub enum OpKind {
     InstallCore,
     PinAdd,
     PinRemove,
+    NodeRemove,
+    PluginPromote,
     ManualUndo,
     #[serde(untagged)]
     Historical(String),
@@ -63,6 +145,8 @@ impl std::fmt::Display for OpKind {
             Self::InstallCore => "install_core",
             Self::PinAdd => "pin_add",
             Self::PinRemove => "pin_remove",
+            Self::NodeRemove => "node_remove",
+            Self::PluginPromote => "plugin_promote",
             Self::ManualUndo => "manual_undo",
             Self::Historical(kind) => kind,
         };
@@ -119,6 +203,101 @@ pub fn load_plugins(root: &ProjectRoot) -> Result<Vec<PluginRecord>> {
     let records = serde_json::from_str::<Vec<PluginRecord>>(&text)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     Ok(records)
+}
+
+pub fn save_plugins(root: &ProjectRoot, plugins: &[PluginRecord]) -> Result<()> {
+    crate::fs_support::atomic_write(
+        &root.plugins_registry(),
+        &serde_json::to_vec_pretty(plugins)?,
+    )
+}
+
+pub fn next_tx_id() -> Result<TxId> {
+    let stamp = OffsetDateTime::now_utc().format(format_description!(
+        "[year][month][day]T[hour][minute][second]Z"
+    ))?;
+    let suffix =
+        getrandom::u32().map_err(|error| anyhow!("failed to generate transaction ID: {error}"))?;
+    Ok(TxId(format!("{stamp}-{suffix:08x}")))
+}
+
+pub fn save_transaction(root: &ProjectRoot, tx: &TransactionRecord) -> Result<()> {
+    let id = TxId(tx.id.clone());
+    validate_tx_id(&id)?;
+    crate::fs_support::atomic_write(
+        &root.transactions_dir().join(format!("{}.json", tx.id)),
+        &serde_json::to_vec_pretty(tx)?,
+    )
+}
+
+pub fn load_transaction(root: &ProjectRoot, id: &TxId) -> Result<TransactionRecord> {
+    validate_tx_id(id)?;
+    let path = root.transactions_dir().join(format!("{}.json", id.0));
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let tx: TransactionRecord = serde_json::from_str(&text)?;
+    ensure!(tx.id == id.0, "transaction ID differs from filename");
+    Ok(tx)
+}
+
+fn validate_tx_id(id: &TxId) -> Result<()> {
+    ensure!(
+        !id.0.is_empty() && id.0.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
+        "invalid transaction ID"
+    );
+    Ok(())
+}
+
+pub fn write_conflict(root: &ProjectRoot, tx: &TransactionRecord, raw: &str) -> Result<String> {
+    let dir = root.state_dir().join("conflicts");
+    let log = dir.join(format!("{}.lock.log", tx.id));
+    crate::fs_support::atomic_write(&log, raw.as_bytes())?;
+    let report = ConflictReport {
+        txid: tx.id.clone(),
+        node_id: tx.node_id.clone().unwrap_or_default(),
+        created_at: now_string()?,
+        raw_log: crate::platform::to_state_path(&log),
+        summary: raw.lines().take(40).collect::<Vec<_>>().join("\n"),
+        detected_packages: detect_conflict_packages(raw),
+        input_hint: format!("Use: gov resolve {} --pin pkg==version", tx.id),
+    };
+    let path = dir.join(format!("{}.json", tx.id));
+    crate::fs_support::atomic_write(&path, &serde_json::to_vec_pretty(&report)?)?;
+    Ok(crate::platform::to_state_path(&path))
+}
+
+fn detect_conflict_packages(raw: &str) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for line in raw.lines() {
+        let words: Vec<_> = line.split_whitespace().collect();
+        for pair in words.windows(2) {
+            if matches!(
+                pair[0].to_ascii_lowercase().as_str(),
+                "package" | "requires"
+            ) {
+                let token = pair[1].trim_matches(|ch: char| {
+                    !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_' && ch != '.'
+                });
+                let name = crate::toml_support::normalize_package_name(token);
+                if crate::toml_support::is_package_name(&name) {
+                    names.insert(name);
+                }
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+pub fn load_conflict(root: &ProjectRoot, id: &TxId) -> Result<Option<ConflictReport>> {
+    validate_tx_id(id)?;
+    let path = root
+        .state_dir()
+        .join("conflicts")
+        .join(format!("{}.json", id.0));
+    let Some(text) = crate::fs_support::read_text_if_exists(&path)? else {
+        return Ok(None);
+    };
+    Ok(Some(serde_json::from_str(&text)?))
 }
 
 pub fn load_transactions(root: &ProjectRoot) -> Result<Vec<TransactionRecord>> {
