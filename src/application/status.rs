@@ -98,7 +98,7 @@ fn prod_env_exists(root: &ProjectRoot, config: Option<&RuntimeConfig>) -> bool {
         .map(|value| root.as_path().join(&value.runtime.prod_env))
         .unwrap_or_else(|| root.prod_env_dir());
 
-    relative.exists()
+    relative.is_dir()
 }
 
 fn describe_probe(result: anyhow::Result<CmdResult>) -> String {

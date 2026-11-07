@@ -147,12 +147,28 @@ pub fn run_smoke_test(env_path: &Path, config: &RuntimeConfig) -> Result<SmokeRe
         ),
     };
 
-    let mut child = Command::new(&program)
-        .args(&args)
+    execute_smoke(&program, &args, config.tx.timeout_seconds)
+}
+
+pub fn run_torch_smoke_test(env_path: &Path, config: &RuntimeConfig) -> Result<SmokeResult> {
+    let program = platform::venv_python(env_path)
+        .to_string_lossy()
+        .into_owned();
+    let args = ["-c", "import torch, torchvision, torchaudio"];
+    execute_smoke(&program, &args, config.tx.timeout_seconds)
+}
+
+fn execute_smoke(
+    program: &str,
+    args: &[impl AsRef<std::ffi::OsStr>],
+    timeout_seconds: u32,
+) -> Result<SmokeResult> {
+    let mut child = Command::new(program)
+        .args(args)
         .stdout(std::io::stderr())
         .spawn()
         .with_context(|| format!("failed to run smoke test `{program}`"))?;
-    let timeout = Duration::from_secs(config.tx.timeout_seconds.into());
+    let timeout = Duration::from_secs(timeout_seconds.into());
     if let Some(status) = child.wait_timeout(timeout)? {
         return Ok(SmokeResult {
             passed: status.success(),

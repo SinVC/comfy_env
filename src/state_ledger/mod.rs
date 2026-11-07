@@ -47,6 +47,8 @@ impl TransactionRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpKind {
+    InstallTorch,
+    InstallCore,
     PinAdd,
     PinRemove,
     ManualUndo,
@@ -57,6 +59,8 @@ pub enum OpKind {
 impl std::fmt::Display for OpKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
+            Self::InstallTorch => "install_torch",
+            Self::InstallCore => "install_core",
             Self::PinAdd => "pin_add",
             Self::PinRemove => "pin_remove",
             Self::ManualUndo => "manual_undo",

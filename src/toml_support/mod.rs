@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use toml_edit::{Array, DocumentMut, Item, Table, value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
 
 #[derive(Debug, Deserialize)]
 pub struct RuntimeConfig {
@@ -69,6 +69,7 @@ pub struct SmokeTestConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupEditMode {
+    Replace,
     UpsertExact,
     RemoveNames,
 }
@@ -140,6 +141,15 @@ pub fn rewrite_dependency_group(
         .as_array_mut()
         .with_context(|| format!("dependency-groups.{group} must be an array"))?;
 
+    if mode == GroupEditMode::Replace {
+        array.clear();
+        for spec in specs {
+            array.push(spec.as_str());
+        }
+        crate::fs_support::atomic_write(path, doc.to_string().as_bytes())?;
+        return Ok(());
+    }
+
     // Walk backwards so only the last request for each normalized name survives.
     let mut names = HashSet::new();
     let mut unique = Vec::new();
@@ -174,6 +184,85 @@ pub fn rewrite_dependency_group(
 
     crate::fs_support::atomic_write(path, doc.to_string().as_bytes())?;
     Ok(())
+}
+
+pub fn configure_torch_index(path: &Path, url: &str) -> Result<String> {
+    let mut doc = read_project(path)?;
+    let uv = doc
+        .as_table_mut()
+        .entry("tool")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .context("tool must be a table")?
+        .entry("uv")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .context("tool.uv must be a table")?;
+
+    let indexes = uv
+        .entry("index")
+        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .context("tool.uv.index must be an array of tables")?;
+    let base = torch_index_name(url);
+    let mut name = base.clone();
+    let mut suffix = 2;
+    loop {
+        let existing_url_matches = indexes
+            .iter()
+            .find(|index| index.get("name").and_then(Item::as_str) == Some(&name))
+            .map(|index| index.get("url").and_then(Item::as_str) == Some(url));
+        match existing_url_matches {
+            Some(true) => break,
+            Some(false) => {
+                name = format!("{base}-{suffix}");
+                suffix += 1;
+            }
+            None => {
+                let mut index = Table::new();
+                index["name"] = value(name.as_str());
+                index["url"] = value(url);
+                index["explicit"] = value(true);
+                indexes.push(index);
+                break;
+            }
+        }
+    }
+
+    let sources = uv
+        .entry("sources")
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .context("tool.uv.sources must be a table")?;
+    for package in ["torch", "torchvision", "torchaudio"] {
+        let mut source = InlineTable::new();
+        source.insert("index", Value::from(name.as_str()));
+        sources[package] = Item::Value(Value::InlineTable(source));
+    }
+
+    crate::fs_support::atomic_write(path, doc.to_string().as_bytes())?;
+    Ok(name)
+}
+
+fn torch_index_name(url: &str) -> String {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    let segment = path.rsplit('/').next().unwrap_or("index");
+    let slug: String = segment
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    format!("pytorch-{}", if slug.is_empty() { "index" } else { slug })
 }
 
 pub fn normalize_package_name(spec: &str) -> String {
