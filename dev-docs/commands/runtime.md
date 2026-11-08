@@ -36,6 +36,7 @@ Launch ComfyUI from the production environment. Optionally sync prod env before 
 ### Writes
 
 - `state/comfyui.pid` — write PID of launched process
+- `state/comfyui.pid.lock` — coordinate startup, stop, and PID cleanup
 - `.venv-prod/` — synced if `--sync` or `sync_before_run` is configured
 
 ### Success Path
@@ -67,6 +68,7 @@ Launch ComfyUI from the production environment. Optionally sync prod env before 
   - Linux: check `/proc/<pid>` or `kill -0 <pid>`
   - Windows: `OpenProcess` with existence check
 - Extra args from config and CLI are concatenated
+- `run.extra_args` accepts a TOML array of strings for exact arguments, or a legacy whitespace-separated string
 
 ---
 

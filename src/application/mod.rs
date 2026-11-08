@@ -20,7 +20,7 @@ use crate::domain::{AppError, AppResult, OpId, ProjectRoot};
 use crate::safety_guards;
 use crate::toml_support::{self, RuntimeConfig};
 
-pub fn dispatch(cli: Cli) -> AppResult<()> {
+pub fn dispatch(cli: Cli) -> AppResult<i32> {
     let root = ProjectRoot::discover()?;
 
     match cli.command {
@@ -69,10 +69,11 @@ pub fn dispatch(cli: Cli) -> AppResult<()> {
             OpSubcommand::Inspect(inspect_args) => ops::cmd_op_inspect(inspect_args, &root),
         },
         Commands::Undo(args) => undo::cmd_undo(args, &root),
-        Commands::Run(args) => runtime::cmd_run(args, &root),
+        Commands::Run(args) => return runtime::cmd_run(args, &root),
         Commands::Stop => runtime::cmd_stop(&root),
         Commands::Status => status::cmd_status(&root),
     }
+    .map(|()| 0)
 }
 
 fn configured_uv(root: &ProjectRoot) -> AppResult<(RuntimeConfig, UvClient)> {

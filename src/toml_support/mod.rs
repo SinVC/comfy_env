@@ -1,9 +1,12 @@
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
+use toml_edit::{
+    Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value, value,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct RuntimeConfig {
@@ -17,6 +20,37 @@ pub struct RuntimeConfig {
     pub ops: OpsConfig,
     #[serde(default)]
     pub policy: PolicyConfig,
+    #[serde(default)]
+    pub run: RunConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RunConfig {
+    pub extra_args: RunExtraArgs,
+    pub sync_before_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RunExtraArgs {
+    Args(Vec<String>),
+    Legacy(String),
+}
+
+impl Default for RunExtraArgs {
+    fn default() -> Self {
+        Self::Args(Vec::new())
+    }
+}
+
+impl RunExtraArgs {
+    pub fn to_args(&self) -> Vec<OsString> {
+        match self {
+            Self::Args(args) => args.iter().map(OsString::from).collect(),
+            Self::Legacy(text) => text.split_whitespace().map(OsString::from).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,21 +163,85 @@ pub fn read_config(path: &Path) -> Result<Option<RuntimeConfig>> {
 pub fn set_import_config(path: &Path, comfyui_dir: &Path, python: &str) -> Result<()> {
     let text = crate::fs_support::read_text_if_exists(path)?.unwrap_or_default();
     let mut doc = text.parse::<DocumentMut>()?;
-    let paths = doc
-        .as_table_mut()
-        .entry("paths")
-        .or_insert(Item::Table(Table::new()))
-        .as_table_mut()
-        .context("paths must be a table")?;
-    paths["comfyui_dir"] = value(comfyui_dir.to_string_lossy().as_ref());
-    let runtime = doc
-        .as_table_mut()
-        .entry("runtime")
-        .or_insert(Item::Table(Table::new()))
-        .as_table_mut()
-        .context("runtime must be a table")?;
-    runtime["python"] = value(python);
+    set_runtime_config(&mut doc, comfyui_dir, python)?;
     crate::fs_support::atomic_write(path, doc.to_string().as_bytes())
+}
+
+pub fn config_for_init(path: &Path) -> Result<(DocumentMut, RuntimeConfig)> {
+    let doc = read_or_template(path)?;
+    let config = toml_edit::de::from_str(&doc.to_string())
+        .with_context(|| format!("invalid configuration for {}", path.display()))?;
+    Ok((doc, config))
+}
+
+pub fn configure_init(doc: &mut DocumentMut, comfyui_dir: &Path, python: &str) -> Result<()> {
+    set_runtime_config(doc, comfyui_dir, python)?;
+    for section in ["tx", "policy", "ops", "run"] {
+        ensure_table(doc.as_table_mut(), section)?;
+    }
+    Ok(())
+}
+
+pub fn project_for_init(path: &Path, python: &str, marker: &str) -> Result<DocumentMut> {
+    let mut doc = read_or_template(path)?;
+    let project = ensure_table(doc.as_table_mut(), "project")?;
+    set_value(
+        project,
+        "requires-python",
+        Value::from(format!("=={python}.*")),
+    );
+    let tool = ensure_table(doc.as_table_mut(), "tool")?;
+    let uv = ensure_table(tool, "uv")?;
+    set_value(
+        uv,
+        "environments",
+        Value::Array([marker].into_iter().collect()),
+    );
+    Ok(doc)
+}
+
+fn read_or_template(path: &Path) -> Result<DocumentMut> {
+    let (text, source) = match crate::fs_support::read_text_if_exists(path)? {
+        Some(text) => (text, path.to_owned()),
+        None => {
+            let template = path.with_extension("toml.template");
+            let text = std::fs::read_to_string(&template)
+                .with_context(|| format!("failed to read {}", template.display()))?;
+            (text, template)
+        }
+    };
+    text.parse()
+        .with_context(|| format!("failed to parse {}", source.display()))
+}
+
+fn set_runtime_config(doc: &mut DocumentMut, comfyui_dir: &Path, python: &str) -> Result<()> {
+    let comfyui_dir = comfyui_dir
+        .to_str()
+        .context("ComfyUI path is not valid UTF-8")?;
+    let paths = ensure_table(doc.as_table_mut(), "paths")?;
+    set_value(paths, "comfyui_dir", Value::from(comfyui_dir));
+    let runtime = ensure_table(doc.as_table_mut(), "runtime")?;
+    set_value(runtime, "python", Value::from(python));
+    Ok(())
+}
+
+fn ensure_table<'a>(parent: &'a mut dyn TableLike, key: &str) -> Result<&'a mut dyn TableLike> {
+    if !parent.contains_key(key) {
+        parent.insert(key, Item::Table(Table::new()));
+    }
+    parent
+        .get_mut(key)
+        .and_then(Item::as_table_like_mut)
+        .with_context(|| format!("{key} must be a table"))
+}
+
+fn set_value(table: &mut dyn TableLike, key: &str, mut new: Value) {
+    if let Some(old) = table.get_mut(key).and_then(Item::as_value_mut) {
+        *new.decor_mut() = old.decor().clone();
+        *old = new;
+    } else {
+        table.insert(key, Item::Value(new));
+    }
 }
 
 pub fn read_dependency_group(path: &Path, group: &str) -> Result<Vec<String>> {

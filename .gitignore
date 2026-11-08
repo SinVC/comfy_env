@@ -25,3 +25,4 @@ state/work/
 state/plugins.json
 state/snapshots_index.json
 state/comfyui.pid
+state/comfyui.pid.lock

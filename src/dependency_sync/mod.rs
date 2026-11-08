@@ -43,6 +43,29 @@ impl UvClient {
         run_uv(uv_command().args(["python", "find", "--no-python-downloads", selector]))
     }
 
+    pub fn resolve_python_minor(selector: &str) -> Result<String> {
+        let selector = selector.trim();
+        ensure!(!selector.is_empty(), "Python selector must not be empty");
+        if let Some((major, minor)) = selector.split_once('.')
+            && [major, minor]
+                .into_iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Ok(format!(
+                "{}.{}",
+                major.parse::<u32>()?,
+                minor.parse::<u32>()?
+            ));
+        }
+        let found = Self::find_python(selector)?;
+        ensure!(
+            found.success,
+            "target Python lookup failed: {}",
+            found.summary_line()
+        );
+        crate::platform::PythonClient::version_minor(Path::new(&found.stdout))
+    }
+
     pub fn lock(&self, project_dir: &Path, root: &ProjectRoot) -> Result<CmdResult> {
         let mut command = uv_command();
         command

@@ -37,18 +37,19 @@ fn run_candidate(
 fn run_prod(
     env_path: &Path,
     comfyui_dir: &Path,
-    args: &[String],
+    args: &[OsString],
     pid_path: &Path,
+    before_launch: impl FnOnce() -> Result<()>,
 ) -> Result<i32>
 ```
 
-1. Check stale PID (via `platform::is_process_alive`)
-2. Resolve Python: `venv_python(env_path)`
+1. Acquire the PID lock and check for an existing process
+2. Run the pre-launch hook for optional sync, then resolve Python with `venv_python(env_path)`
 3. Build command: `[python, <comfyui_dir>/main.py] + args`
 4. Spawn child process
-5. Write child PID to `pid_path`
+5. Write child PID to `pid_path` and release the PID lock
 6. Wait for child exit
-7. Remove PID file
+7. Reacquire the PID lock and remove the PID file if it still belongs to this run
 8. Return child exit code
 
 **Contract**: Blocks until ComfyUI exits. PID file exists only while process is running. Differs from Bash era (`exec` replaced the process) — Rust spawns a child to enable PID tracking.

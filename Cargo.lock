@@ -275,6 +275,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "getrandom",
+ "libc",
  "predicates",
  "serde",
  "serde_json",
@@ -284,6 +285,7 @@ dependencies = [
  "time",
  "toml_edit",
  "wait-timeout",
+ "windows-sys",
 ]
 
 [[package]]

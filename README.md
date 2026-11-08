@@ -1,12 +1,12 @@
 # Comfy Environment Governance (`comfy_env`)
 
-当前分支正在把 ComfyUI 依赖治理 CLI 迁移到 Rust。可用命令包括 `gov pin add/list/remove`、`gov op list/inspect`、`gov undo`、`gov status` 和 `gov help`。在侧车项目根目录运行这些命令。修改 pin 需要已有的 `config.toml`、`pyproject.toml` 和 `uv.lock`。其余命令仍在迁移中。
+ComfyUI 依赖治理 CLI 已迁移到 Rust。在侧车项目根目录运行 `gov help` 查看命令，使用 `gov init` 创建本地配置和生产环境。
 
 编译使用 `cargo build --release`。Linux 的二进制文件为 `target/release/gov`，Windows 为 `target/release/gov.exe`。开发与审查从 [Rust 架构说明](dev-docs/architecture.md) 进入。[命令契约](dev-docs/commands/contracts.md) 给出每个命令的设计。
 
-## 迁移目标与完整工作流
+## 完整工作流
 
-以下章节描述完整迁移后的命令和目录结构。`bin/gov` 是保留的 Bash 行为参考。
+以下章节描述命令和目录结构。`bin/gov` 是保留的 Bash 行为参考。
 
 ## 1. 项目目标
 

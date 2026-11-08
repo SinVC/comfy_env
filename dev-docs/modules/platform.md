@@ -30,7 +30,7 @@ fn is_process_alive(pid: u32) -> bool
 | Platform | Implementation |
 |----------|---------------|
 | Linux | Check `/proc/<pid>/` existence or `kill(pid, 0)` |
-| Windows | `OpenProcess` with existence check |
+| Windows | `OpenProcess` and check whether the process handle is signaled |
 
 **Contract**: Returns `true` only if the process is still running. Used by `run` (stale PID detection) and `stop`.
 
@@ -48,7 +48,7 @@ Product semantics (both platforms):
 | Platform | Graceful | Forced |
 |----------|----------|--------|
 | Linux | `SIGTERM` | `SIGKILL` |
-| Windows | Platform-native graceful (e.g., `GenerateConsoleCtrlEvent` or `WM_CLOSE`) | `TerminateProcess` |
+| Windows | Send Ctrl+Break to the launched console process group | `TerminateProcess` |
 
 **Contract**: After this function returns `Ok`, the process is guaranteed to be dead. Returns error only if PID doesn't exist or permissions are insufficient.
 
@@ -94,7 +94,8 @@ Converts a forward-slash state path back to platform-native `PathBuf`.
 
 ## Dependencies
 
-- Only `std` (no external crates needed)
+- `std` for path handling and process launching
+- `libc` on Unix and `windows-sys` on Windows for native process control
 
 ## Used By
 

@@ -13,8 +13,6 @@ pub type AppResult<T> = Result<T, AppError>;
 pub enum AppError {
     #[error("{message}")]
     Usage { message: String },
-    #[error("command '{command}' is not yet implemented")]
-    Unimplemented { command: String },
     #[error("{message}")]
     Runtime { message: String },
 }
@@ -26,12 +24,6 @@ impl AppError {
         }
     }
 
-    pub fn unimplemented(command: impl Into<String>) -> Self {
-        Self::Unimplemented {
-            command: command.into(),
-        }
-    }
-
     pub fn runtime(message: impl Into<String>) -> Self {
         Self::Runtime {
             message: message.into(),
@@ -40,7 +32,7 @@ impl AppError {
 
     pub const fn exit_code(&self) -> i32 {
         match self {
-            Self::Usage { .. } | Self::Unimplemented { .. } => 2,
+            Self::Usage { .. } => 2,
             Self::Runtime { .. } => 1,
         }
     }

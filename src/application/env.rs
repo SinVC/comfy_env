@@ -9,7 +9,7 @@ use crate::cli::{EnvExportArgs, EnvImportArgs};
 use crate::dependency_sync::UvClient;
 use crate::domain::{AppError, AppResult, OpId, ProjectRoot};
 use crate::fs_support;
-use crate::platform::{self, PythonClient};
+use crate::platform::{self, PythonClient, platform_machine, sys_platform};
 use crate::safety_guards;
 use crate::state_ledger::{self, OpKind, PluginRecord};
 use crate::toml_support::{self, RuntimeConfig};
@@ -203,7 +203,7 @@ fn env_import(args: EnvImportArgs, root: &ProjectRoot) -> Result<()> {
         manifest.bundle_format_version == "1",
         "unsupported bundle format version"
     );
-    let python = resolve_python_minor(&args.python)?;
+    let python = UvClient::resolve_python_minor(&args.python)?;
     let project = toml_support::read_project(&args.bundle_dir.join("pyproject.toml"))?;
     let requires = project
         .get("project")
@@ -516,24 +516,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     Ok(fs::canonicalize(parent)?.join(name))
 }
 
-fn resolve_python_minor(spec: &str) -> Result<String> {
-    let parts: Vec<_> = spec.split('.').collect();
-    if parts.len() == 2
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
-    {
-        return Ok(spec.into());
-    }
-    let found = UvClient::find_python(spec)?;
-    ensure!(
-        found.success,
-        "target Python lookup failed: {}",
-        found.summary_line()
-    );
-    PythonClient::version_minor(Path::new(&found.stdout))
-}
-
 fn python_satisfies(python: &str, requires: &str) -> Result<bool> {
     let mut parts = python.split('.');
     let major: u32 = parts.next().context("invalid Python minor")?.parse()?;
@@ -612,16 +594,6 @@ fn marker_matches_host(marker: &str) -> bool {
     })
 }
 
-fn sys_platform() -> &'static str {
-    if cfg!(windows) {
-        "win32"
-    } else if cfg!(target_os = "macos") {
-        "darwin"
-    } else {
-        "linux"
-    }
-}
-
 fn platform_system() -> &'static str {
     if cfg!(windows) {
         "Windows"
@@ -629,21 +601,5 @@ fn platform_system() -> &'static str {
         "Darwin"
     } else {
         "Linux"
-    }
-}
-
-fn platform_machine() -> &'static str {
-    if cfg!(windows) && cfg!(target_arch = "x86_64") {
-        "AMD64"
-    } else if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(windows) && cfg!(target_arch = "aarch64") {
-        "ARM64"
-    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        std::env::consts::ARCH
     }
 }

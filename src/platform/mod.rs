@@ -3,6 +3,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+#[path = "process_unix.rs"]
+mod process;
+#[cfg(windows)]
+#[path = "process_windows.rs"]
+mod process;
+
+pub use process::{
+    RunInterrupts, check_process_alive, configure_prod_process, exit_code, terminate_process,
+};
+
 pub struct PythonClient;
 
 impl PythonClient {
@@ -73,27 +84,25 @@ pub fn from_state_path(path: &str) -> PathBuf {
     }
 }
 
-#[cfg(windows)]
 pub fn is_process_alive(pid: u32) -> bool {
-    let filter = format!("PID eq {pid}");
-    let Ok(output) = Command::new("tasklist")
-        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-        .output()
-    else {
-        return false;
-    };
-
-    if !output.status.success() {
-        return false;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.contains(&format!("\"{pid}\""))
+    check_process_alive(pid).unwrap_or(false)
 }
 
-#[cfg(not(windows))]
-pub fn is_process_alive(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
+pub fn sys_platform() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "win32",
+        "macos" => "darwin",
+        os => os,
+    }
+}
+
+pub fn platform_machine() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => "AMD64",
+        ("windows", "aarch64") => "ARM64",
+        ("macos", "aarch64") => "arm64",
+        (_, arch) => arch,
+    }
 }
 
 #[cfg(test)]

@@ -35,7 +35,7 @@ Parses `config.toml` into a typed struct. Tolerant of missing optional fields (u
 - `tx.smoke_test: Option<SmokTestConfig>` (program + args)
 - `policy.core_packages: Vec<String>`
 - `ops.retention_count: u32` (default: 100)
-- `run.extra_args: String`
+- `run.extra_args: Vec<String>` or a legacy whitespace-separated string
 - `run.sync_before_run: bool`
 
 ### 2. Config Writing

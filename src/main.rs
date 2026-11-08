@@ -25,7 +25,7 @@ where
 {
     match Cli::try_parse_from(args) {
         Ok(cli) => match application::dispatch(cli) {
-            Ok(()) => 0,
+            Ok(code) => code,
             Err(error) => {
                 eprintln!("error: {error}");
                 error.exit_code()

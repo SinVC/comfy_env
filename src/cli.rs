@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -18,25 +19,40 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Bootstrap the project and production environment
     Init(InitArgs),
+    /// Install managed ComfyUI or PyTorch dependencies
     Install(InstallArgs),
+    /// Manage dependency overrides
     Pin(PinArgs),
+    /// Register and remove custom nodes
     Node(NodeArgs),
+    /// Observe and promote custom-node dependency transactions
     Tx(TxArgs),
+    /// Observe and promote ComfyUI core dependency updates
     Update(UpdateArgs),
+    /// Resolve a custom-node dependency conflict
     Resolve(ResolveArgs),
+    /// Export or import a managed environment
     Env(EnvArgs),
+    /// View the operation ledger
     Op(OpArgs),
+    /// Restore the backup for an operation
     Undo(UndoArgs),
+    /// Run ComfyUI in the production environment
     Run(RunArgs),
+    /// Stop ComfyUI launched by gov run
     Stop,
+    /// Report project and runtime status
     Status,
 }
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
+    /// Absolute path to the ComfyUI directory
     #[arg(long)]
     pub comfyui_dir: Option<PathBuf>,
+    /// Python minor version or interpreter selector
     #[arg(long)]
     pub python: Option<String>,
 }
@@ -261,8 +277,10 @@ pub struct UndoArgs {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
+    /// Sync the locked production environment before launch
     #[arg(long)]
     pub sync: bool,
+    /// Arguments to pass to ComfyUI after --
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
 }

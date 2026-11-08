@@ -215,10 +215,9 @@ fn print_notes(
 }
 
 fn read_runtime_pid(root: &ProjectRoot) -> Option<u32> {
-    let text = crate::fs_support::read_text_if_exists(&root.pid_file())
+    crate::runtime_executor::read_pid(&root.pid_file())
         .ok()
-        .flatten()?;
-    text.trim().parse().ok()
+        .flatten()
 }
 
 fn display_value(value: &str) -> String {
