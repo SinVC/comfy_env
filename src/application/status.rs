@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::dependency_sync::UvClient;
-use crate::domain::{AppResult, CmdResult, ProjectRoot, TxStatus};
-use crate::platform;
+use crate::domain::{AppResult, CmdResult, ProjectRoot, TORCH_FAMILY, TxKind, TxStatus};
 use crate::source_integration::GitClient;
 use crate::state_ledger::{self, TransactionRecord};
 use crate::toml_support::{self, RuntimeConfig};
@@ -14,7 +13,7 @@ pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
         .iter()
         .map(|spec| toml_support::normalize_package_name(spec))
         .collect();
-    let torch_ready = ["torch", "torchvision", "torchaudio"]
+    let torch_ready = TORCH_FAMILY
         .iter()
         .all(|name| torch.iter().any(|pkg| pkg == name));
     let core_ready = !toml_support::dependency_group(&project, "core")?.is_empty();
@@ -30,12 +29,27 @@ pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
                 .is_some_and(|py| !py.trim().is_empty())
     });
     let plugins = state_ledger::load_plugins(root)?;
-    let transactions = state_ledger::load_transactions(root)?;
-    let runtime_pid = read_runtime_pid(root);
-    let runtime_running = runtime_pid.is_some_and(platform::is_process_alive);
+    let transactions = state_ledger::list_transactions(root)?;
+    let pending = state_ledger::list_operations(root)?
+        .into_iter()
+        .filter(|op| op.needs_recovery())
+        .map(|op| op.op_id)
+        .collect::<Vec<_>>();
+    let runtime = match crate::runtime_executor::runtime_status(&root.pid_file()) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("warning: could not verify runtime identity: {error:#}");
+            None
+        }
+    };
+    let runtime_pid = runtime.map(|(pid, _)| pid);
+    let runtime_running = runtime.is_some_and(|(_, alive)| alive);
 
     println!("project_root: {}", root.as_path().display());
     println!("config_ready: {config_ready}");
+    if !pending.is_empty() {
+        println!("operations_needing_recovery: {}", pending.join(", "));
+    }
     println!("comfyui_dir: {}", config_comfyui_dir(config.as_ref()));
     println!("python: {}", config_python(config.as_ref()));
     println!(
@@ -58,7 +72,7 @@ pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
     println!("transactions_pending: {}", pending.clone().count());
     println!(
         "update_transactions_pending: {}",
-        pending.filter(|tx| tx.kind == "core_update").count()
+        pending.filter(|tx| tx.kind == TxKind::CoreUpdate).count()
     );
     println!("transactions_recent: {}", transactions.len().min(8));
     println!("runtime_running: {}", runtime_running);
@@ -167,7 +181,7 @@ fn print_recent_transactions(transactions: &[TransactionRecord]) {
         println!(
             "  - {} | {} | {} | {} | {}",
             display_value(&record.id),
-            display_value(&record.kind),
+            display_value(&record.kind.to_string()),
             record
                 .status
                 .as_ref()
@@ -212,12 +226,6 @@ fn print_notes(
     for note in notes {
         println!("  - {note}");
     }
-}
-
-fn read_runtime_pid(root: &ProjectRoot) -> Option<u32> {
-    crate::runtime_executor::read_pid(&root.pid_file())
-        .ok()
-        .flatten()
 }
 
 fn display_value(value: &str) -> String {

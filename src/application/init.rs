@@ -3,12 +3,16 @@ use std::fs;
 use anyhow::{Context, ensure};
 
 use crate::cli::InitArgs;
-use crate::dependency_sync::UvClient;
+use crate::dependency_sync::{self, UvClient};
 use crate::domain::{AppError, AppResult, ProjectRoot};
-use crate::{fs_support, platform, state_ledger, toml_support};
+use crate::state_ledger::OpKind;
+use crate::{fs_support, platform, safety_guards, state_ledger, toml_support};
 
 pub fn cmd_init(args: InitArgs, root: &ProjectRoot) -> AppResult<()> {
     let config_path = root.config_toml();
+    safety_guards::ensure_production_recoverable(root)?;
+    let existing =
+        config_path.is_file() && root.pyproject_toml().is_file() && root.uv_lock().is_file();
     if !config_path.try_exists()? && (args.comfyui_dir.is_none() || args.python.is_none()) {
         return Err(AppError::usage(
             "first init requires --comfyui-dir and --python",
@@ -39,9 +43,9 @@ pub fn cmd_init(args: InitArgs, root: &ProjectRoot) -> AppResult<()> {
     toml_support::configure_init(&mut config_doc, comfyui_dir, &python)?;
     let project_path = root.pyproject_toml();
     let project_doc = toml_support::project_for_init(&project_path, &python, &marker)?;
+    let stage = dependency_sync::stage_init(root, &project_doc.to_string())?;
+    ensure_uv_success(&uv.lock(stage.path(), root)?, "lock")?;
 
-    fs_support::atomic_write(&config_path, config_doc.to_string().as_bytes())?;
-    fs_support::atomic_write(&project_path, project_doc.to_string().as_bytes())?;
     let state = root.state_dir();
     for path in [
         root.transactions_dir(),
@@ -55,12 +59,41 @@ pub fn cmd_init(args: InitArgs, root: &ProjectRoot) -> AppResult<()> {
         fs::create_dir_all(&path)
             .with_context(|| format!("failed to create {}", path.display()))?;
     }
-    if !root.plugins_registry().try_exists()? {
-        state_ledger::save_plugins(root, &[])?;
+    let write_truth = || -> anyhow::Result<()> {
+        fs_support::atomic_write(&config_path, config_doc.to_string().as_bytes())?;
+        dependency_sync::promote_workdir(&stage, root)?;
+        if !root.plugins_registry().try_exists()? {
+            state_ledger::save_plugins(root, &[])?;
+        }
+        Ok(())
+    };
+    if existing {
+        if config
+            .runtime
+            .python
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(AppError::usage(
+                "existing project has no configured Python for recovery",
+            ));
+        }
+        super::production::commit(
+            root,
+            OpKind::Reinit,
+            &python,
+            None,
+            |record| safety_guards::backup_config(record, root),
+            |write| {
+                write_truth()?;
+                write.sync(&config, &uv)
+            },
+        )?;
+        super::prune_history(root, &config);
+    } else {
+        write_truth()?;
+        uv.sync_prod(root, &config)?;
     }
-
-    ensure_uv_success(&uv.lock(root.as_path(), root)?, "lock")?;
-    uv.sync_prod(root, &config)?;
     println!("Initialized production environment for Python {python}.");
     Ok(())
 }

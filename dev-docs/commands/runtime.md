@@ -1,126 +1,35 @@
-# runtime (run / stop)
+# Runtime
 
-**Implementation target:** [src/application/runtime.rs](../../src/application/runtime.rs)
+[Implementation](../../src/application/runtime.rs)
 
-## `run`
+## `gov run [--sync] [-- <args...>]`
 
-### Synopsis
+Run ComfyUI with the production venv Python and return its exit status. Requires
+a configured ComfyUI directory containing `main.py` and an existing production
+venv. Configured extra arguments precede the passthrough arguments. The
+`run.extra_args` setting accepts an array for exact arguments and a legacy
+whitespace-separated string.
 
-```
-gov run [--sync] [-- <args...>]
-```
+Under the PID lock, check any previous process record and remove it if stale.
+If requested by the flag or `run.sync_before_run`, sync the locked production
+environment before starting ComfyUI. An operation awaiting recovery blocks
+startup. Record the new process PID and host creation identity in
+`state/comfyui.pid`, release the lock, and wait. On exit, reacquire the lock
+and remove the matching record. Output goes to the terminal.
 
-### Purpose
+## `gov stop`
 
-Launch ComfyUI from the production environment. Optionally sync prod env before launching.
+Read the process record under the same lock. Missing records and identities
+that have exited are successful no-op stops. A recycled PID is treated as stale.
+A living process from a legacy numeric record is unverified. Stop it manually
+after checking its identity. A dead legacy record can be cleaned up normally.
 
-### Arguments
+For a verified process, attempt graceful termination, wait up to 30 seconds,
+and force termination if needed. Linux uses SIGTERM and SIGKILL through a PID
+file descriptor. Windows launches the production tree inside a Job Object,
+attempts Ctrl+Break, and uses the same verified process handle and the Job
+Object to force termination if needed. Remove the record after the tree exits.
 
-| Flag | Required | Description |
-|------|----------|-------------|
-| `--sync` | No | Run `uv sync` before launching |
-| `-- <args>` | No | Arguments passed through to ComfyUI `main.py` |
-
-### Preconditions
-
-- `config.toml` must exist
-- Prod env must exist (`.venv-prod/`)
-- ComfyUI `main.py` must exist at `<comfyui_dir>/main.py`
-- No other instance should be running (check PID file)
-
-### Reads
-
-- `config.toml` — comfyui_dir, prod_env, run.extra_args, run.sync_before_run
-- `state/comfyui.pid` — check for existing process
-
-### Writes
-
-- `state/comfyui.pid` — write PID of launched process
-- `state/comfyui.pid.lock` — coordinate startup, stop, and PID cleanup
-- `.venv-prod/` — synced if `--sync` or `sync_before_run` is configured
-
-### Success Path
-
-```
-1. Check for existing PID file:
-   - IF PID file exists AND process is alive: exit with "already running" error
-   - IF PID file exists AND process is dead: clean up stale PID file
-2. IF --sync OR config run.sync_before_run:
-   - Sync prod env via [Prod Sync Protocol]
-3. Resolve Python: venv_python(prod_env_path)
-4. Build command: [venv_python, <comfyui_dir>/main.py] + extra_args + passthrough args
-5. Spawn ComfyUI as child process
-6. Write PID → state/comfyui.pid
-7. Wait for child process to exit
-8. Clean up PID file
-9. Return child's exit code
-```
-
-### Compatibility Notes (Bash → Rust)
-
-- **Bash era**: used `exec` to replace the shell process with ComfyUI. After exec, `gov` no longer existed as a process.
-- **Rust era**: spawns ComfyUI as a child process, writes PID, waits for exit. This enables PID tracking and cleanup on both platforms.
-
-### Platform Notes
-
-- PID file contains the child process PID (integer as text)
-- Process liveness check:
-  - Linux: check `/proc/<pid>` or `kill -0 <pid>`
-  - Windows: `OpenProcess` with existence check
-- Extra args from config and CLI are concatenated
-- `run.extra_args` accepts a TOML array of strings for exact arguments, or a legacy whitespace-separated string
-
----
-
-## `stop`
-
-### Synopsis
-
-```
-gov stop
-```
-
-### Purpose
-
-Stop a running ComfyUI process launched by `gov run`.
-
-### Preconditions
-
-- `state/comfyui.pid` should exist (if not, report no process)
-
-### Reads
-
-- `state/comfyui.pid` — PID of running process
-
-### Writes
-
-- `state/comfyui.pid` — deleted after successful stop
-
-### Success Path
-
-```
-1. Read PID from state/comfyui.pid
-2. IF PID file missing: print "no running process", exit success
-3. Check if process is alive:
-   - IF not alive: clean up stale PID file, print "process not running", exit success
-4. Request graceful termination:
-   - Linux: send SIGTERM
-   - Windows: platform-native graceful termination
-5. Wait up to 30 seconds for process to exit
-6. IF process still alive after timeout:
-   - Forced termination:
-     - Linux: send SIGKILL
-     - Windows: TerminateProcess
-7. Clean up PID file
-8. Report success
-```
-
-### Product Semantics
-
-The user-visible contract is: **"stop" means the process will be terminated, first gracefully then forcefully.** The 30-second timeout is the grace window. The exact mechanism is platform-specific but the outcome is guaranteed: after `gov stop` returns, the process is no longer running.
-
-### Platform Notes
-
-- Process tree: ideally terminate the entire process group/tree, not just the root PID
-- Stale PID detection must be robust on both platforms
-- PID file is always cleaned up, even if the process was already dead
+Commands that write production configuration, truth, source, or the venv check
+the process record before writing. When the tracked instance is live, run
+`gov stop` before retrying. The gate covers instances started by gov.

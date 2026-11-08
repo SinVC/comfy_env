@@ -1,26 +1,29 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::cli::{TxInspectArgs, TxPromoteArgs, TxRunArgs};
+use crate::cli::{TxAbortArgs, TxInspectArgs, TxPromoteArgs, TxRunArgs};
 use crate::dependency_sync::{self, UvClient};
-use crate::domain::{AppError, AppResult, ProjectRoot, TxId, TxStatus};
+use crate::domain::{AppError, AppResult, GroupName, NodeId, ProjectRoot, TxId, TxKind, TxStatus};
 use crate::platform;
 use crate::runtime_executor::{self, RunOutcome};
-use crate::safety_guards;
 use crate::source_integration;
-use crate::state_ledger::{self, OpKind, PackageDiff, PromotionRecord, TransactionRecord};
+use crate::state_ledger::{
+    self, Observation, ObservationOutcome, OpKind, OperationLink, PackageDiff, TransactionRecord,
+};
 use crate::toml_support::{self, GroupEditMode, RuntimeConfig};
 
 pub fn cmd_tx_run(args: TxRunArgs, root: &ProjectRoot) -> AppResult<()> {
     super::node::validate_node_id(&args.node_id)?;
     let (config, uv) = super::configured_uv(root)?;
-    let plugin = state_ledger::load_plugins(root)?
-        .into_iter()
+    let plugins = state_ledger::load_plugins(root)?;
+    let plugin = plugins
+        .iter()
         .find(|p| p.id == args.node_id)
         .ok_or_else(|| AppError::usage(format!("node not registered: {}", args.node_id)))?;
+    super::node::validate_group_owner(&plugins, &plugin.group, &plugin.id)?;
     if state_ledger::load_transactions(root)?.iter().any(|tx| {
         tx.node_id.as_deref() == Some(&args.node_id) && tx.status == Some(TxStatus::Running)
     }) {
@@ -34,7 +37,7 @@ pub fn cmd_tx_run(args: TxRunArgs, root: &ProjectRoot) -> AppResult<()> {
         .comfyui_dir
         .as_ref()
         .ok_or_else(|| AppError::usage("config.toml is missing paths.comfyui_dir"))?;
-    let source = source_integration::plugin_install_path(comfy, &plugin.id);
+    let source = source_integration::plugin_install_path(comfy, &NodeId(plugin.id.clone()));
     if !source.is_dir() {
         return Err(AppError::usage(format!(
             "node source missing: {}",
@@ -47,36 +50,33 @@ pub fn cmd_tx_run(args: TxRunArgs, root: &ProjectRoot) -> AppResult<()> {
         .as_path()
         .join(&config.runtime.candidate_root)
         .join(&id.0);
+    let baseline = truth_hashes(root.as_path())?;
     let stage = dependency_sync::create_staged_workdir(root)?;
-    let stage_path = stage.persist();
     let mut tx = TransactionRecord {
         id: id.0.clone(),
-        kind: "plugin".into(),
+        kind: TxKind::Plugin,
         status: Some(TxStatus::Running),
         subject: plugin.id.clone(),
         node_id: Some(plugin.id.clone()),
+        plugin_group: Some(GroupName(plugin.group.clone())),
         created_at: Some(state_ledger::now_string()?),
         candidate_env: platform::to_state_path(&candidate),
-        staged_workdir: platform::to_state_path(&stage_path),
+        staged_workdir: platform::to_state_path(stage.path()),
         observed_requirements: requirements,
         ..Default::default()
     };
-    state_ledger::save_transaction(root, &tx)?;
-    let requirements = tx.observed_requirements.clone();
-    let locked = match stage_plugin(
+    begin_observation(root, &mut tx, baseline)?;
+    let stage_path = stage.persist();
+    let locked = match stage_transaction(
         &stage_path,
-        &plugin.group,
-        &requirements,
-        &[],
+        &GroupName(plugin.group.clone()),
         &uv,
         root,
         &mut tx,
     ) {
         Ok(locked) => locked,
         Err(error) => {
-            tx.status = Some(TxStatus::Failed);
-            tx.updated_at = Some(state_ledger::now_string()?);
-            state_ledger::save_transaction(root, &tx)?;
+            mark_failed(root, &mut tx, &error)?;
             return Err(error.into());
         }
     };
@@ -96,30 +96,39 @@ pub fn cmd_tx_run(args: TxRunArgs, root: &ProjectRoot) -> AppResult<()> {
     Ok(())
 }
 
-pub(crate) fn stage_plugin(
+pub(crate) fn mark_failed(
+    root: &ProjectRoot,
+    tx: &mut TransactionRecord,
+    error: &anyhow::Error,
+) -> Result<()> {
+    tx.status = Some(TxStatus::Failed);
+    tx.updated_at = Some(state_ledger::now_string()?);
+    tx.logs.failure = Some(format!("{error:#}"));
+    state_ledger::save_transaction(root, tx)
+}
+
+pub(crate) fn stage_transaction(
     stage: &Path,
-    group: &str,
-    requirements: &[String],
-    pins: &[String],
+    group: &GroupName,
     uv: &UvClient,
     root: &ProjectRoot,
     tx: &mut TransactionRecord,
 ) -> Result<bool> {
+    let project_path = stage.join("pyproject.toml");
+    let project = toml_support::read_project(&project_path)?;
+    let group =
+        toml_support::existing_group_name(&project, &group.0)?.unwrap_or_else(|| group.0.clone());
     toml_support::rewrite_dependency_group(
-        &stage.join("pyproject.toml"),
-        group,
+        &project_path,
+        &group,
         GroupEditMode::Replace,
-        requirements,
+        &tx.observed_requirements,
     )?;
-    if !pins.is_empty() {
-        toml_support::rewrite_dependency_group(
-            &stage.join("pyproject.toml"),
-            "overrides",
-            GroupEditMode::UpsertExact,
-            pins,
-        )?;
-    }
-    let lock = uv.lock(stage, root)?;
+    super::pin::apply_resolution_pins(&project_path, tx)?;
+    let lock = uv.lock_tracked(stage, root, |process| {
+        tx.candidate_process = process;
+        state_ledger::save_transaction(root, tx)
+    })?;
     if !lock.success {
         tx.conflict_report = Some(state_ledger::write_conflict(root, tx, &lock.stderr)?);
         tx.status = Some(TxStatus::NeedsResolution);
@@ -130,6 +139,40 @@ pub(crate) fn stage_plugin(
     Ok(true)
 }
 
+pub(crate) fn begin_observation(
+    root: &ProjectRoot,
+    tx: &mut TransactionRecord,
+    baseline: BTreeMap<String, String>,
+) -> Result<()> {
+    ensure!(
+        truth_hashes(root.as_path())? == baseline,
+        "production truth changed while staging; rerun the transaction"
+    );
+    tx.status = Some(TxStatus::Running);
+    tx.owner = Some(platform::ProcessIdentity::capture(std::process::id())?);
+    tx.candidate_process = None;
+    tx.candidate_ready = false;
+    tx.pre_freeze.clear();
+    tx.post_freeze.clear();
+    tx.diff = PackageDiff::default();
+    tx.core_impact.clear();
+    tx.logs = Default::default();
+    tx.attempt = Some(
+        tx.attempt
+            .unwrap_or(if tx.created_at.is_some() && tx.updated_at.is_some() {
+                1
+            } else {
+                0
+            })
+            + 1,
+    );
+    tx.observation = None;
+    tx.updated_at = None;
+    tx.staged_truth_sha256 = None;
+    tx.base_truth_sha256 = Some(baseline);
+    state_ledger::save_transaction(root, tx)
+}
+
 pub(crate) fn observe_candidate(
     root: &ProjectRoot,
     config: &RuntimeConfig,
@@ -138,56 +181,236 @@ pub(crate) fn observe_candidate(
     stage: &Path,
     timeout: u32,
 ) -> Result<()> {
-    let candidate = platform::from_state_path(&tx.candidate_env);
+    use ObservationOutcome as Outcome;
+    let candidate = root
+        .as_path()
+        .join(platform::from_state_path(&tx.candidate_env));
     let logs = root.state_dir().join("logs");
-    fs::create_dir_all(&logs)?;
-    let stdout = logs.join(format!("{}.stdout.log", tx.id));
-    let stderr = logs.join(format!("{}.stderr.log", tx.id));
+    let log_id = match tx.attempt {
+        Some(attempt) if attempt > 1 => format!("{}.attempt-{attempt}", tx.id),
+        _ => tx.id.clone(),
+    };
+    let stdout = logs.join(format!("{log_id}.stdout.log"));
+    let stderr = logs.join(format!("{log_id}.stderr.log"));
     tx.logs.stdout = platform::to_state_path(&stdout);
     tx.logs.stderr = platform::to_state_path(&stderr);
-    let observation = (|| -> Result<()> {
-        tx.pre_freeze = uv.pip_freeze(&root.as_path().join(&config.runtime.prod_env))?;
-        let sync = uv.sync(stage, &candidate)?;
+    let mut observation = Observation {
+        outcome: Outcome::InfrastructureFailed,
+        candidate_before: Vec::new(),
+        package_drift: PackageDiff::default(),
+        node_failures: Vec::new(),
+    };
+    let result = (|| -> Result<Outcome> {
+        fs::create_dir_all(&logs)?;
+        let candidate_root =
+            crate::fs_support::resolved_path(&root.as_path().join(&config.runtime.candidate_root))?;
+        let candidate_path = crate::fs_support::resolved_path(&candidate)?;
+        let prod_path =
+            crate::fs_support::resolved_path(&root.as_path().join(&config.runtime.prod_env))?;
+        ensure!(
+            candidate.is_absolute()
+                && candidate_path == candidate_root.join(&tx.id)
+                && !candidate_path.starts_with(&prod_path)
+                && !prod_path.starts_with(&candidate_path),
+            "candidate path is outside the transaction's environment or overlaps production"
+        );
+        tx.staged_truth_sha256 = Some(truth_hashes(stage)?);
+        tx.conflict_report = None;
+        tx.pre_freeze = freeze(uv, &root.as_path().join(&config.runtime.prod_env))?;
+        state_ledger::save_transaction(root, tx)?;
+        observation.outcome = Outcome::SyncFailed;
+        let sync = uv.sync_tracked(stage, &candidate, |process| {
+            tx.candidate_process = process;
+            state_ledger::save_transaction(root, tx)
+        })?;
         ensure!(
             sync.success,
             "candidate sync failed: {}",
             sync.summary_line()
         );
         tx.candidate_ready = true;
+        observation.outcome = Outcome::InfrastructureFailed;
+        observation.candidate_before = freeze(uv, &candidate)?;
         let comfy = config
             .paths
             .comfyui_dir
             .as_ref()
+            .filter(|path| !path.as_os_str().is_empty())
             .context("config.toml is missing paths.comfyui_dir")?;
-        let outcome =
-            runtime_executor::run_candidate(&candidate, comfy, timeout, &stdout, &stderr)?;
-        tx.post_freeze = uv.pip_freeze(&candidate)?;
+        let comfy = root.as_path().join(comfy);
+        let probe = tempfile::tempdir_in(&logs)?;
+        let report = probe.path().join("result");
+        let outcome = runtime_executor::run_candidate(
+            &candidate,
+            &comfy,
+            timeout,
+            &stdout,
+            &stderr,
+            &report,
+            |identity| {
+                tx.candidate_process = Some(identity);
+                state_ledger::save_transaction(root, tx)
+            },
+        )?;
+        tx.candidate_process = None;
+        match outcome {
+            RunOutcome::Passed => tx.logs.run_exit_code = Some(0),
+            RunOutcome::Failed(code) => tx.logs.run_exit_code = Some(code),
+            RunOutcome::TimedOut => tx.logs.timed_out = true,
+            RunOutcome::Interrupted => {}
+        }
+        tx.post_freeze = freeze(uv, &candidate)?;
         tx.diff = freeze_diff(&tx.pre_freeze, &tx.post_freeze);
         tx.core_impact = core_impact(&tx.diff, config);
-        match outcome {
-            RunOutcome::Passed => {
-                tx.status = Some(TxStatus::Completed);
-                tx.logs.run_exit_code = Some(0);
-            }
-            RunOutcome::Failed(code) => {
-                tx.status = Some(TxStatus::Failed);
-                tx.logs.run_exit_code = Some(code);
-            }
-            RunOutcome::TimedOut => {
-                tx.status = Some(TxStatus::Completed);
-                tx.logs.timed_out = true;
-                tx.logs.run_exit_code = Some(-1);
-            }
+        observation.package_drift = freeze_diff(&observation.candidate_before, &tx.post_freeze);
+        ensure!(
+            tx.staged_truth_sha256.as_ref() == Some(&truth_hashes(stage)?),
+            "staged truth changed during the observation; rerun the transaction"
+        );
+        if tx.post_freeze != observation.candidate_before {
+            return Ok(Outcome::PackageDrift);
         }
-        Ok(())
+        let report = crate::fs_support::read_text_if_exists(&report)?;
+        let mut loads = runtime_executor::node_load_results(&stdout)?;
+        loads.extend(runtime_executor::node_load_results(&stderr)?);
+        observation.node_failures = loads
+            .iter()
+            .filter(|(_, passed)| !passed)
+            .map(|(path, _)| path.clone())
+            .collect();
+        match outcome {
+            RunOutcome::TimedOut => return Ok(Outcome::TimedOut),
+            RunOutcome::Interrupted => return Ok(Outcome::Interrupted),
+            _ => {}
+        }
+        if report.as_deref() == Some("unsupported") {
+            return Ok(Outcome::ProbeUnsupported);
+        }
+        if report.is_none() {
+            bail!("candidate failed before the startup probe could initialize; see logs");
+        }
+        let target_loaded = if let Some(id) = &tx.node_id {
+            let expected = source_integration::plugin_install_path(&comfy, &NodeId(id.clone()))
+                .canonicalize()?;
+            let mut loaded = false;
+            for (path, passed) in &loads {
+                if comfy.join(path).canonicalize().ok().as_ref() == Some(&expected) {
+                    if !passed {
+                        return Ok(Outcome::NodeLoadFailed);
+                    }
+                    loaded = true;
+                }
+            }
+            loaded
+        } else {
+            if !observation.node_failures.is_empty() {
+                return Ok(Outcome::NodeLoadFailed);
+            }
+            true
+        };
+        match outcome {
+            RunOutcome::Failed(_) => Ok(Outcome::NonzeroExit),
+            RunOutcome::Passed if report.as_deref() != Some("completed") => {
+                Ok(Outcome::ProbeIncomplete)
+            }
+            RunOutcome::Passed if !target_loaded => Ok(Outcome::NodeLoadFailed),
+            RunOutcome::Passed => Ok(Outcome::Passed),
+            RunOutcome::TimedOut | RunOutcome::Interrupted => unreachable!(),
+        }
     })();
-    if let Err(error) = &observation {
-        tx.status = Some(TxStatus::Failed);
-        let _ = crate::fs_support::atomic_write(&stderr, format!("{error:#}\n").as_bytes());
+    match &result {
+        Ok(outcome) => observation.outcome = *outcome,
+        Err(error) => tx.logs.failure = Some(format!("{error:#}")),
     }
+    tx.status = Some(if observation.outcome == Outcome::Passed {
+        TxStatus::Completed
+    } else {
+        TxStatus::Failed
+    });
+    tx.observation = Some(observation);
     tx.updated_at = Some(state_ledger::now_string()?);
     state_ledger::save_transaction(root, tx)?;
-    observation
+    result.map(|_| ())
+}
+
+fn freeze(uv: &UvClient, env: &Path) -> Result<Vec<String>> {
+    let mut packages = uv.pip_freeze(env)?;
+    packages.sort_unstable();
+    Ok(packages)
+}
+
+pub(crate) fn truth_hashes(dir: &Path) -> Result<BTreeMap<String, String>> {
+    ["pyproject.toml", "uv.lock"]
+        .into_iter()
+        .map(|name| Ok((name.to_owned(), crate::fs_support::sha256(&dir.join(name))?)))
+        .collect()
+}
+
+pub(crate) fn check_snapshot(
+    root: &ProjectRoot,
+    config: &RuntimeConfig,
+    uv: &UvClient,
+    tx: &TransactionRecord,
+    allow_failed: bool,
+    approve_core: bool,
+) -> Result<PathBuf> {
+    const RERUN: &str = "run a fresh transaction or resolve the conflict and observe again";
+    let observation = tx
+        .observation
+        .as_ref()
+        .with_context(|| format!("transaction has no complete observation; {RERUN}"))?;
+    match (tx.status, observation.outcome) {
+        (Some(TxStatus::Completed | TxStatus::Resolved), ObservationOutcome::Passed) => {}
+        (Some(TxStatus::Failed), ObservationOutcome::NonzeroExit) if allow_failed => {
+            ensure!(
+                tx.logs.run_exit_code.is_some_and(|code| code != 0),
+                "missing nonzero exit evidence; {RERUN}"
+            );
+        }
+        (Some(TxStatus::Failed), ObservationOutcome::NonzeroExit) => {
+            bail!("nonzero candidate exit requires --allow-failed-run")
+        }
+        _ => bail!(
+            "transaction observation {:?} is not promotable; {RERUN}",
+            observation.outcome
+        ),
+    }
+    ensure!(
+        tx.candidate_ready && tx.candidate_process.is_none(),
+        "candidate setup or cleanup is incomplete; {RERUN}"
+    );
+    ensure!(
+        tx.base_truth_sha256.as_ref()
+            == Some(
+                &truth_hashes(root.as_path())
+                    .with_context(|| format!("missing production truth; {RERUN}"))?
+            ),
+        "production truth changed after observation; {RERUN}"
+    );
+    let stage = checked_artifact(&tx.staged_workdir, &root.work_dir())
+        .with_context(|| format!("staged workdir unavailable; {RERUN}"))?;
+    ensure!(
+        tx.staged_truth_sha256.as_ref()
+            == Some(
+                &truth_hashes(&stage).with_context(|| format!("missing staged truth; {RERUN}"))?
+            ),
+        "staged truth changed after observation; {RERUN}"
+    );
+    ensure!(
+        freeze(uv, &root.as_path().join(&config.runtime.prod_env))? == tx.pre_freeze,
+        "production package set changed after observation; {RERUN}"
+    );
+    ensure!(
+        observation.candidate_before == tx.post_freeze,
+        "candidate package set drifted; {RERUN}"
+    );
+    let impact = core_impact(&freeze_diff(&tx.pre_freeze, &tx.post_freeze), config);
+    ensure!(
+        impact.is_empty() || approve_core,
+        "core impact requires --approve-core: {}",
+        impact.join(", ")
+    );
+    Ok(stage)
 }
 
 pub(crate) fn freeze_diff(before: &[String], after: &[String]) -> PackageDiff {
@@ -262,6 +485,10 @@ fn read_plugin_requirements(path: &Path) -> AppResult<Vec<String>> {
 pub fn cmd_tx_inspect(args: TxInspectArgs, root: &ProjectRoot) -> AppResult<()> {
     let tx = state_ledger::load_transaction(root, &TxId(args.tx_id))?;
     ensure_plugin_tx(&tx)?;
+    inspect_transaction(root, &tx)
+}
+
+pub(crate) fn inspect_transaction(root: &ProjectRoot, tx: &TransactionRecord) -> AppResult<()> {
     println!(
         "Transaction: {}\nKind: {}\nSubject: {}\nStatus: {}",
         tx.id,
@@ -269,6 +496,13 @@ pub fn cmd_tx_inspect(args: TxInspectArgs, root: &ProjectRoot) -> AppResult<()> 
         tx.subject,
         tx.status.unwrap_or(TxStatus::Running)
     );
+    if tx.kind == TxKind::CoreUpdate {
+        println!(
+            "Source requirements: {}\nSource SHA256: {}",
+            tx.source_requirements_path.as_deref().unwrap_or("-"),
+            tx.source_requirements_sha256.as_deref().unwrap_or("-")
+        );
+    }
     println!(
         "Started: {}\nEnded: {}",
         tx.created_at.as_deref().unwrap_or("-"),
@@ -297,30 +531,88 @@ pub fn cmd_tx_inspect(args: TxInspectArgs, root: &ProjectRoot) -> AppResult<()> 
         };
         println!("{name}: {path}{label}");
     }
-    println!("Stdout: {}\nStderr: {}", tx.logs.stdout, tx.logs.stderr);
+    print_observation(tx);
     if tx.status == Some(TxStatus::NeedsResolution) {
         if let Some(conflict) = state_ledger::load_conflict(root, &TxId(tx.id.clone()))? {
             println!("Conflict: {}\n{}", conflict.summary, conflict.input_hint);
         }
     }
-    if let Some(promotion) = tx.promotion {
-        println!(
-            "Promotion: {}\nOperation: {}\nReason: {}",
-            promotion.status,
-            promotion.op_id.unwrap_or_default(),
-            promotion.reason.unwrap_or_default()
-        );
-    }
+    print_promotion(root, tx);
     Ok(())
 }
 
-pub fn cmd_tx_abort(args: TxInspectArgs, root: &ProjectRoot) -> AppResult<()> {
+fn print_promotion(root: &ProjectRoot, tx: &TransactionRecord) {
+    if let Some(promotion) = &tx.promotion {
+        let op_id = promotion.op_id.as_deref().unwrap_or_default();
+        println!(
+            "Promotion: {}\nOperation: {}\nReason: {}",
+            promotion.status,
+            op_id,
+            promotion.reason.as_deref().unwrap_or_default()
+        );
+        if !op_id.is_empty()
+            && let Ok(operation) =
+                state_ledger::load_operation(root, &crate::domain::OpId(op_id.to_owned()))
+            && operation.status == crate::domain::OpStatus::Undone
+        {
+            println!(
+                "Promotion operation undone: {}",
+                operation.undo_reference.unwrap_or_default()
+            );
+        }
+    }
+}
+
+fn print_observation(tx: &TransactionRecord) {
+    println!("Stdout: {}\nStderr: {}", tx.logs.stdout, tx.logs.stderr);
+    if let Some(observation) = &tx.observation {
+        println!(
+            "Observation: {:?}\nNode load failures: {}\nCandidate added: {}\nCandidate removed: {}",
+            observation.outcome,
+            observation.node_failures.join(", "),
+            observation.package_drift.added.join(", "),
+            observation.package_drift.removed.join(", "),
+        );
+    }
+    if let Some(error) = &tx.logs.failure {
+        println!("Observation error: {error}");
+    }
+}
+
+pub fn cmd_tx_abort(args: TxAbortArgs, root: &ProjectRoot) -> AppResult<()> {
     let mut tx = state_ledger::load_transaction(root, &TxId(args.tx_id))?;
     ensure_plugin_tx(&tx)?;
+    abort(root, &mut tx, args.confirm_stopped)?;
+    println!("Transaction aborted: {}", tx.id);
+    Ok(())
+}
+
+pub(crate) fn abort(
+    root: &ProjectRoot,
+    tx: &mut TransactionRecord,
+    confirm_stopped: bool,
+) -> AppResult<()> {
+    if tx.status == Some(TxStatus::Aborted) {
+        return Ok(());
+    }
+    if let Some(op) = state_ledger::operations_for_recovery(root)?
+        .into_iter()
+        .find(|op| {
+            op.needs_recovery()
+                && matches!(op.kind, OpKind::PluginPromote | OpKind::CorePromote)
+                && op.reference == tx.id
+        })
+    {
+        return Err(AppError::usage(format!(
+            "promotion requires recovery; run gov op recover {}",
+            op.op_id
+        )));
+    }
     if !matches!(
         tx.status,
         Some(
-            TxStatus::Completed
+            TxStatus::Running
+                | TxStatus::Completed
                 | TxStatus::Failed
                 | TxStatus::NeedsResolution
                 | TxStatus::Resolved
@@ -332,7 +624,31 @@ pub fn cmd_tx_abort(args: TxInspectArgs, root: &ProjectRoot) -> AppResult<()> {
             tx.id, tx.status
         )));
     }
-    let config = super::configured_uv(root)?.0;
+    if tx.status == Some(TxStatus::Running) {
+        if let Some(owner) = &tx.owner {
+            if owner.is_alive()? {
+                return Err(AppError::usage("transaction owner is still running"));
+            }
+        } else if !confirm_stopped {
+            return Err(AppError::usage(
+                "old running transaction lacks process identity; verify its owner and candidate have exited, then retry with --confirm-stopped",
+            ));
+        }
+    }
+    if let Some(candidate) = &tx.candidate_process
+        && candidate.candidate_is_alive()?
+    {
+        return Err(AppError::usage("candidate process tree is still running"));
+    }
+    let config = super::configured(root)?;
+    if !tx.candidate_env.is_empty() {
+        let path = platform::from_state_path(&tx.candidate_env);
+        if path.file_name() != Some(std::ffi::OsStr::new(&tx.id)) {
+            return Err(AppError::usage(
+                "candidate path does not belong to this transaction",
+            ));
+        }
+    }
     remove_tx_artifact(
         &tx.candidate_env,
         &root.as_path().join(&config.runtime.candidate_root),
@@ -340,157 +656,109 @@ pub fn cmd_tx_abort(args: TxInspectArgs, root: &ProjectRoot) -> AppResult<()> {
     remove_tx_artifact(&tx.staged_workdir, &root.work_dir())?;
     tx.status = Some(TxStatus::Aborted);
     tx.updated_at = Some(state_ledger::now_string()?);
-    state_ledger::save_transaction(root, &tx)?;
-    println!("Transaction aborted: {}", tx.id);
+    state_ledger::save_transaction(root, tx)?;
     Ok(())
 }
 
 pub fn cmd_tx_promote(args: TxPromoteArgs, root: &ProjectRoot) -> AppResult<()> {
-    let mut tx = state_ledger::load_transaction(root, &TxId(args.tx_id))?;
+    let tx = state_ledger::load_transaction(root, &TxId(args.tx_id))?;
     ensure_plugin_tx(&tx)?;
-    if !matches!(
-        tx.status,
-        Some(TxStatus::Completed | TxStatus::Resolved | TxStatus::Failed)
-    ) {
-        return Err(AppError::usage(format!(
-            "transaction {} is not promotable",
-            tx.id
-        )));
-    }
-    if tx.status == Some(TxStatus::Failed)
-        && (!args.allow_failed_run
-            || !tx.candidate_ready
-            || tx.logs.run_exit_code.unwrap_or(0) == 0)
-    {
-        return Err(AppError::usage(
-            "failed transaction requires an observed nonzero run and --allow-failed-run",
-        ));
+    if super::production::resume_link(root, OpKind::PluginPromote, &tx.id)? {
+        return Ok(());
     }
     let (config, uv) = super::configured_uv(root)?;
+    let stage = check_snapshot(
+        root,
+        &config,
+        &uv,
+        &tx,
+        args.allow_failed_run,
+        args.approve_core,
+    )?;
     let mut plugins = state_ledger::load_plugins(root)?;
     let plugin = plugins
         .iter()
         .find(|p| tx.node_id.as_deref() == Some(&p.id))
         .cloned()
         .ok_or_else(|| AppError::usage("transaction plugin is no longer registered"))?;
-    let mut plan = tx.observed_requirements.clone();
-    let names: BTreeSet<_> = plan
-        .iter()
-        .map(|s| toml_support::normalize_package_name(s))
-        .collect();
-    for spec in &tx.diff.added {
-        if !names.contains(&toml_support::normalize_package_name(spec)) {
-            plan.push(spec.clone());
-        }
+    super::node::validate_group_owner(&plugins, &plugin.group, &plugin.id)?;
+    if tx.plugin_group.as_ref().map(|group| group.0.as_str()) != Some(plugin.group.as_str()) {
+        return Err(AppError::usage(
+            "node dependency group changed after observation; run a fresh transaction",
+        ));
     }
-    let stage = dependency_sync::create_staged_workdir(root)?;
-    let locked = stage_plugin(
-        stage.path(),
-        &plugin.group,
-        &plan,
-        &tx.resolution_pins.clone(),
-        &uv,
+    let promotion = OperationLink::Promotion {
+        tx_id: TxId(tx.id.clone()),
+        reason: args.reason,
+        keep_artifacts: args.keep_artifacts,
+    };
+    super::production::commit(
         root,
-        &mut tx,
-    )?;
-    if !locked {
-        println!("Transaction needs resolution: {}", tx.id);
-        return Ok(());
-    }
-    let pre = uv.pip_freeze(&root.as_path().join(&config.runtime.prod_env))?;
-    fs::create_dir_all(root.as_path().join(&config.runtime.candidate_root))?;
-    let probe = tempfile::Builder::new()
-        .prefix("gov-probe-")
-        .tempdir_in(root.as_path().join(&config.runtime.candidate_root))?;
-    let probe_env = probe.path().join("env");
-    let sync = uv.sync(stage.path(), &probe_env)?;
-    if !sync.success {
-        return Err(AppError::runtime(format!(
-            "promotion candidate sync failed: {}",
-            sync.summary_line()
-        )));
-    }
-    let post = uv.pip_freeze(&probe_env)?;
-    let impact = core_impact(&freeze_diff(&pre, &post), &config);
-    if !impact.is_empty() && !args.approve_core {
-        return Err(AppError::usage(format!(
-            "core impact requires --approve-core: {}",
-            impact.join(", ")
-        )));
-    }
-    let op = safety_guards::op_begin(OpKind::PluginPromote, &tx.id, root)?;
-    let mutation = (|| -> Result<()> {
-        dependency_sync::promote_workdir(&stage, root)?;
-        uv.sync_prod(root, &config).context("prod sync failed")?;
-        let smoke =
-            safety_guards::run_smoke_test(&root.as_path().join(&config.runtime.prod_env), &config)?;
-        if !smoke.passed {
-            bail!("smoke test failed: {}", smoke.detail);
-        }
-        if let Some(entry) = plugins.iter_mut().find(|p| p.id == plugin.id) {
-            entry.managed_deps = plan.clone();
-            entry.updated_at = state_ledger::now_string()?;
-        }
-        state_ledger::save_plugins(root, &plugins)?;
-        tx.status = Some(TxStatus::Promoted);
-        tx.updated_at = Some(state_ledger::now_string()?);
-        tx.promotion = Some(PromotionRecord {
-            status: TxStatus::Promoted,
-            reason: args.reason.clone(),
-            op_id: Some(op.0.clone()),
-            error: None,
-        });
-        state_ledger::save_transaction(root, &tx)?;
-        safety_guards::op_finalize(&op, true, None, root)
-    })();
-    if let Err(error) = mutation {
-        let failure = super::rollback_failed_operation(root, &op, &config, &uv, error);
-        tx.status = Some(TxStatus::PromoteFailed);
-        tx.promotion = Some(PromotionRecord {
-            status: TxStatus::PromoteFailed,
-            reason: args.reason,
-            op_id: Some(op.0),
-            error: Some(failure.to_string()),
-        });
-        tx.updated_at = Some(state_ledger::now_string()?);
-        state_ledger::save_transaction(root, &tx)?;
-        return Err(failure);
-    }
-    if !args.keep_artifacts {
-        for (path, base) in [
-            (
-                &tx.candidate_env,
-                root.as_path().join(&config.runtime.candidate_root),
-            ),
-            (&tx.staged_workdir, root.work_dir()),
-        ] {
-            if let Err(error) = remove_tx_artifact(path, &base) {
-                eprintln!("warning: failed to clean {path}: {error:#}");
+        OpKind::PluginPromote,
+        &tx.id,
+        Some(promotion),
+        |_| Ok(()),
+        |write| {
+            dependency_sync::promote_staged_path(&stage, root)?;
+            write.sync(&config, &uv)?;
+            write.smoke(&config, false)?;
+            if let Some(entry) = plugins.iter_mut().find(|p| p.id == plugin.id) {
+                entry.managed_deps = tx.observed_requirements.clone();
+                entry.updated_at = state_ledger::now_string()?;
             }
-        }
-    }
+            state_ledger::save_plugins(root, &plugins)
+        },
+    )?;
     super::prune_history(root, &config);
     println!("Transaction promoted: {}", tx.id);
     Ok(())
 }
 
+pub(crate) fn clean_artifacts(root: &ProjectRoot, config: &RuntimeConfig, tx: &TransactionRecord) {
+    for (path, base) in [
+        (
+            &tx.candidate_env,
+            root.as_path().join(&config.runtime.candidate_root),
+        ),
+        (&tx.staged_workdir, root.work_dir()),
+    ] {
+        if let Err(error) = remove_tx_artifact(path, &base) {
+            eprintln!("warning: failed to clean {path}: {error:#}");
+        }
+    }
+}
+
 pub(crate) fn remove_tx_artifact(recorded: &str, base: &Path) -> Result<()> {
-    let path = platform::from_state_path(recorded);
-    if !path.exists() {
+    if recorded.is_empty()
+        || crate::fs_support::metadata_if_exists(&platform::from_state_path(recorded))?.is_none()
+    {
         return Ok(());
     }
-    let path = path.canonicalize()?;
+    let path = checked_artifact(recorded, base)?;
+    crate::fs_support::remove_tree(&path)
+}
+
+fn checked_artifact(recorded: &str, base: &Path) -> Result<PathBuf> {
+    let path = platform::from_state_path(recorded);
+    ensure!(!recorded.is_empty(), "invalid transaction artifact path");
+    let metadata = fs::symlink_metadata(&path)?;
+    ensure!(
+        metadata.is_dir() && !crate::fs_support::is_link(&metadata),
+        "transaction artifact is not an ordinary directory: {}",
+        path.display()
+    );
+    let resolved = path.canonicalize()?;
     let base = base.canonicalize()?;
     ensure!(
-        path != base && path.starts_with(&base),
+        resolved != base && resolved.starts_with(&base),
         "transaction artifact is outside its root: {}",
         path.display()
     );
-    fs::remove_dir_all(&path).with_context(|| format!("failed to remove {}", path.display()))
+    Ok(path)
 }
 
 fn ensure_plugin_tx(tx: &TransactionRecord) -> AppResult<()> {
-    if tx.kind != "plugin" {
+    if tx.kind != TxKind::Plugin {
         return Err(AppError::usage(format!(
             "transaction {} is not a plugin transaction",
             tx.id

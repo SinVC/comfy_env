@@ -1,16 +1,13 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Context;
 
 use crate::cli::{InstallArgs, InstallTorchArgs};
 use crate::dependency_sync::{self, UvClient};
-use crate::domain::{AppError, AppResult, ProjectRoot};
-use crate::safety_guards;
+use crate::domain::{AppError, AppResult, ProjectRoot, TORCH_FAMILY};
 use crate::state_ledger::OpKind;
 use crate::toml_support::{self, GroupEditMode, RuntimeConfig};
-
-const TORCH_FAMILY: [&str; 3] = ["torch", "torchvision", "torchaudio"];
 
 pub fn cmd_install(args: InstallArgs, root: &ProjectRoot) -> AppResult<()> {
     let (config, uv) = super::configured_uv(root)?;
@@ -183,27 +180,18 @@ fn promote_install(
     reference: &str,
     torch_smoke: bool,
 ) -> AppResult<()> {
-    let op_id = safety_guards::op_begin(kind, reference, root)?;
-    let mutation = (|| -> Result<()> {
-        dependency_sync::promote_workdir(staged, root)?;
-        uv.sync_prod(root, config)
-            .context("production sync failed")?;
-        let env = root.as_path().join(&config.runtime.prod_env);
-        let smoke = if torch_smoke {
-            safety_guards::run_torch_smoke_test(&env, config)?
-        } else {
-            safety_guards::run_smoke_test(&env, config)?
-        };
-        if !smoke.passed {
-            bail!("smoke test failed: {}", smoke.detail);
-        }
-        safety_guards::op_finalize(&op_id, true, None, root)
-    })();
-    if let Err(error) = mutation {
-        return Err(super::rollback_failed_operation(
-            root, &op_id, config, uv, error,
-        ));
-    }
+    super::production::commit(
+        root,
+        kind,
+        reference,
+        None,
+        |_| Ok(()),
+        |write| {
+            dependency_sync::promote_workdir(staged, root)?;
+            write.sync(config, uv)?;
+            write.smoke(config, torch_smoke)
+        },
+    )?;
     super::prune_history(root, config);
     Ok(())
 }

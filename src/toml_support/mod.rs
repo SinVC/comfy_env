@@ -274,6 +274,32 @@ pub fn dependency_group(doc: &DocumentMut, group: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+pub fn dependency_group_names(doc: &DocumentMut) -> Result<Vec<&str>> {
+    match doc.get("dependency-groups") {
+        Some(groups) => Ok(groups
+            .as_table_like()
+            .context("dependency-groups must be a table")?
+            .iter()
+            .map(|(name, _)| name)
+            .collect()),
+        None => Ok(Vec::new()),
+    }
+}
+
+pub fn existing_group_name(doc: &DocumentMut, group: &str) -> Result<Option<String>> {
+    let normalized = normalize_package_name(group);
+    let names = dependency_group_names(doc)?;
+    let mut matching = names
+        .into_iter()
+        .filter(|name| normalize_package_name(name) == normalized);
+    let name = matching.next();
+    anyhow::ensure!(
+        matching.next().is_none(),
+        "multiple dependency groups normalize to {normalized}"
+    );
+    Ok(name.map(str::to_owned))
+}
+
 pub fn rewrite_dependency_group(
     path: &Path,
     group: &str,
@@ -338,35 +364,138 @@ pub fn rewrite_dependency_group(
     Ok(())
 }
 
-pub fn upsert_uv_overrides(path: &Path, pins: &[String]) -> crate::domain::AppResult<()> {
-    let mut doc = read_project(path)?;
-    let tool = doc
-        .as_table_mut()
-        .entry("tool")
-        .or_insert(Item::Table(Table::new()))
-        .as_table_like_mut()
-        .context("tool must be a table")?;
-    let uv = tool
-        .entry("uv")
-        .or_insert(Item::Table(Table::new()))
-        .as_table_like_mut()
-        .context("tool.uv must be a table")?;
-    let overrides = uv
-        .entry("override-dependencies")
-        .or_insert(value(Array::new()))
-        .as_array_mut()
+pub fn uv_overrides(doc: &DocumentMut) -> Result<Vec<String>> {
+    let Some(overrides) = doc
+        .get("tool")
+        .and_then(|item| item.get("uv"))
+        .and_then(|item| item.get("override-dependencies"))
+    else {
+        return Ok(Vec::new());
+    };
+    let values = overrides
+        .as_array()
         .context("tool.uv.override-dependencies must be an array")?;
-    let names: HashSet<_> = pins.iter().map(|pin| normalize_package_name(pin)).collect();
-    overrides.retain(|entry| {
-        !entry
-            .as_str()
-            .is_some_and(|spec| names.contains(&normalize_package_name(spec)))
-    });
-    for pin in pins {
-        overrides.push(pin.as_str());
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .context("uv requirement override must be a string")
+        })
+        .collect()
+}
+
+pub fn unscoped_exact_pin(spec: &str) -> Option<(String, &str)> {
+    let (name, version) = spec.split_once("==")?;
+    let (name, version) = (name.trim(), version.trim());
+    if !is_package_name(name) || !is_pin_version(version) {
+        return None;
+    }
+    Some((normalize_package_name(name), version))
+}
+
+pub fn edit_pins(
+    path: &Path,
+    specs: &[String],
+    force_names: &[String],
+    remove: bool,
+) -> crate::domain::AppResult<()> {
+    use crate::domain::AppError;
+
+    let mut doc = read_project(path)?;
+    let group = dependency_group(&doc, "overrides")?;
+    let overrides = uv_overrides(&doc)?;
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    let mut group_edits = HashSet::new();
+    let mut override_edits = HashSet::new();
+    for spec in specs.iter().rev() {
+        let name = normalize_package_name(spec);
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let force = force_names.contains(&name);
+        let group_versions = pin_versions(&group, &name);
+        let override_versions = pin_versions(&overrides, &name);
+        if remove {
+            if group_versions.is_empty() && override_versions.is_empty() {
+                return Err(AppError::usage(format!(
+                    "The dependency `{spec}` could not be found in `dependency-groups.overrides`"
+                )));
+            }
+            if !override_versions.is_empty() {
+                let paired = group_versions.len() == 1 && override_versions == group_versions;
+                if !force && !paired {
+                    return Err(AppError::usage(format!(
+                        "forced override for {name} is unmatched; use --override-requirements"
+                    )));
+                }
+                override_edits.insert(name.clone());
+            }
+            if !group_versions.is_empty() {
+                group_edits.insert(name);
+            }
+        } else {
+            let (_, version) = unscoped_exact_pin(spec).context("expected an exact pin")?;
+            if !force
+                && !override_versions.is_empty()
+                && (override_versions != [version] || group_versions != [version])
+            {
+                return Err(AppError::usage(format!(
+                    "forced override for {name} is active; use --override-requirements to change it"
+                )));
+            }
+            group_edits.insert(name.clone());
+            if force {
+                override_edits.insert(name.clone());
+            }
+            entries.push((name, spec));
+        }
+    }
+    if !group_edits.is_empty() {
+        let groups = ensure_table(doc.as_table_mut(), "dependency-groups")?;
+        let array = pin_array(groups, "overrides")?;
+        rewrite_pin_array(array, &group_edits, &entries);
+    }
+    if !override_edits.is_empty() {
+        let tool = ensure_table(doc.as_table_mut(), "tool")?;
+        let uv = ensure_table(tool, "uv")?;
+        let array = pin_array(uv, "override-dependencies")?;
+        rewrite_pin_array(array, &override_edits, &entries);
     }
     crate::fs_support::atomic_write(path, doc.to_string().as_bytes())?;
     Ok(())
+}
+
+fn pin_versions<'a>(specs: &'a [String], name: &str) -> Vec<&'a str> {
+    specs
+        .iter()
+        .filter_map(|spec| unscoped_exact_pin(spec))
+        .filter_map(|(candidate, version)| (candidate == name).then_some(version))
+        .collect()
+}
+
+fn pin_array<'a>(table: &'a mut dyn TableLike, name: &str) -> Result<&'a mut Array> {
+    table
+        .entry(name)
+        .or_insert(value(Array::new()))
+        .as_array_mut()
+        .with_context(|| format!("{name} must be an array"))
+}
+
+fn rewrite_pin_array(array: &mut Array, names: &HashSet<String>, entries: &[(String, &String)]) {
+    array.retain(|entry| {
+        !entry
+            .as_str()
+            .and_then(unscoped_exact_pin)
+            .is_some_and(|(name, _)| names.contains(&name))
+    });
+    for (name, spec) in entries.iter().rev() {
+        if names.contains(name) {
+            array.push(spec.as_str());
+        }
+    }
 }
 
 pub fn remove_dependency_group(path: &Path, group: &str) -> Result<()> {
@@ -428,7 +557,7 @@ pub fn configure_torch_index(path: &Path, url: &str) -> Result<String> {
         .or_insert(Item::Table(Table::new()))
         .as_table_mut()
         .context("tool.uv.sources must be a table")?;
-    for package in ["torch", "torchvision", "torchaudio"] {
+    for package in crate::domain::TORCH_FAMILY {
         let mut source = InlineTable::new();
         source.insert("index", Value::from(name.as_str()));
         sources[package] = Item::Value(Value::InlineTable(source));
@@ -509,8 +638,11 @@ pub fn is_exact_pin(spec: &str) -> bool {
         return false;
     };
 
-    is_package_name(name)
-        && !version.is_empty()
+    is_package_name(name) && is_pin_version(version)
+}
+
+fn is_pin_version(version: &str) -> bool {
+    !version.is_empty()
         && version
             .bytes()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'.' | b'!' | b'+' | b'-' | b'_'))

@@ -1,15 +1,16 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use crate::cli::{NodeAddArgs, NodeRemoveArgs};
 use crate::dependency_sync;
-use crate::domain::{AppError, AppResult, ProjectRoot};
+use crate::domain::{AppError, AppResult, NodeId, ProjectRoot};
 use crate::safety_guards;
 use crate::source_integration::{self, GitClient};
 use crate::state_ledger::{self, OpKind, PluginRecord};
 use crate::toml_support;
 
 pub fn cmd_node_add(args: NodeAddArgs, root: &ProjectRoot) -> AppResult<()> {
-    let (config, _) = super::configured_uv(root)?;
+    safety_guards::ensure_production_recoverable(root)?;
+    let config = super::configured(root)?;
     let comfy = config
         .paths
         .comfyui_dir
@@ -35,7 +36,15 @@ pub fn cmd_node_add(args: NodeAddArgs, root: &ProjectRoot) -> AppResult<()> {
     if plugins.iter().any(|plugin| plugin.id == id) {
         return Err(AppError::usage(format!("node already registered: {id}")));
     }
-    let target = source_integration::plugin_install_path(&comfy, &id);
+    let group = format!("node-{}", toml_support::normalize_package_name(&id));
+    validate_group_owner(&plugins, &group, &id)?;
+    let project = toml_support::read_project(&root.pyproject_toml())?;
+    if let Some(existing) = toml_support::existing_group_name(&project, &group)? {
+        return Err(AppError::usage(format!(
+            "dependency group {existing} already exists without a registered owner"
+        )));
+    }
+    let target = source_integration::plugin_install_path(&comfy, &NodeId(id.clone()));
     if target.exists() {
         return Err(AppError::usage(format!(
             "node source already exists: {}",
@@ -49,6 +58,7 @@ pub fn cmd_node_add(args: NodeAddArgs, root: &ProjectRoot) -> AppResult<()> {
             git.summary_line()
         )));
     }
+    crate::runtime_executor::ensure_prod_stopped(&root.pid_file())?;
     std::fs::create_dir_all(comfy.join("custom_nodes"))?;
     let cloned = (|| -> Result<()> {
         let result = GitClient::clone(&args.git_url, &target)?;
@@ -68,7 +78,7 @@ pub fn cmd_node_add(args: NodeAddArgs, root: &ProjectRoot) -> AppResult<()> {
             git_url: args.git_url,
             git_ref: args.ref_name.unwrap_or_else(|| "HEAD".to_string()),
             install_relpath: format!("custom_nodes/{id}"),
-            group: format!("node-{}", toml_support::normalize_package_name(&id)),
+            group,
             managed_deps: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
@@ -98,12 +108,13 @@ pub fn cmd_node_remove(args: NodeRemoveArgs, root: &ProjectRoot) -> AppResult<()
         .find(|plugin| plugin.id == args.node_id)
         .cloned()
         .ok_or_else(|| AppError::usage(format!("node not registered: {}", args.node_id)))?;
+    validate_group_owner(&plugins, &plugin.group, &plugin.id)?;
     let comfy = config
         .paths
         .comfyui_dir
         .as_ref()
         .ok_or_else(|| AppError::usage("config.toml is missing paths.comfyui_dir"))?;
-    let source = source_integration::plugin_install_path(comfy, &plugin.id);
+    let source = source_integration::plugin_install_path(comfy, &NodeId(plugin.id.clone()));
     if args.purge_code && !source.is_dir() {
         return Err(AppError::usage(format!(
             "node source missing: {}",
@@ -111,7 +122,10 @@ pub fn cmd_node_remove(args: NodeRemoveArgs, root: &ProjectRoot) -> AppResult<()
         )));
     }
     let staged = dependency_sync::create_staged_workdir(root)?;
-    toml_support::remove_dependency_group(&staged.pyproject_toml(), &plugin.group)?;
+    let project = toml_support::read_project(&staged.pyproject_toml())?;
+    if let Some(group) = toml_support::existing_group_name(&project, &plugin.group)? {
+        toml_support::remove_dependency_group(&staged.pyproject_toml(), &group)?;
+    }
     let lock = uv.lock(staged.path(), root)?;
     if !lock.success {
         return Err(AppError::runtime(format!(
@@ -119,32 +133,58 @@ pub fn cmd_node_remove(args: NodeRemoveArgs, root: &ProjectRoot) -> AppResult<()
             lock.summary_line()
         )));
     }
-    let op = safety_guards::op_begin(OpKind::NodeRemove, &plugin.id, root)?;
-    let result = (|| -> Result<()> {
-        if args.purge_code {
-            safety_guards::backup_custom_node(&op, &source, root)?;
-        }
-        dependency_sync::promote_workdir(&staged, root)?;
-        uv.sync_prod(root, &config).context("prod sync failed")?;
-        let smoke =
-            safety_guards::run_smoke_test(&root.as_path().join(&config.runtime.prod_env), &config)?;
-        if !smoke.passed {
-            bail!("smoke test failed: {}", smoke.detail);
-        }
-        plugins.retain(|entry| entry.id != plugin.id);
-        state_ledger::save_plugins(root, &plugins)?;
-        if args.purge_code {
-            source_integration::remove_plugin_source(&source)?;
-        }
-        safety_guards::op_finalize(&op, true, None, root)
-    })();
-    if let Err(error) = result {
-        return Err(super::rollback_failed_operation(
-            root, &op, &config, &uv, error,
-        ));
-    }
+    super::production::commit(
+        root,
+        OpKind::NodeRemove,
+        &plugin.id,
+        None,
+        |op| {
+            if args.purge_code {
+                safety_guards::backup_custom_node(
+                    &crate::domain::OpId(op.op_id.clone()),
+                    &source,
+                    root,
+                )?;
+            }
+            Ok(())
+        },
+        |write| {
+            dependency_sync::promote_workdir(&staged, root)?;
+            write.sync(&config, &uv)?;
+            write.smoke(&config, false)?;
+            plugins.retain(|entry| entry.id != plugin.id);
+            state_ledger::save_plugins(root, &plugins)?;
+            if args.purge_code {
+                write.touch_source()?;
+                source_integration::remove_plugin_source(&source)?;
+            }
+            Ok(())
+        },
+    )?;
     super::prune_history(root, &config);
     println!("Node removed: {}", args.node_id);
+    Ok(())
+}
+
+pub(crate) fn validate_group_owner(
+    plugins: &[PluginRecord],
+    group: &str,
+    id: &str,
+) -> AppResult<()> {
+    let name = toml_support::normalize_package_name(group);
+    if name.is_empty() || matches!(name.as_str(), "core" | "torch" | "overrides") {
+        return Err(AppError::usage(format!(
+            "node {id} has an invalid or reserved dependency group: {group}"
+        )));
+    }
+    if let Some(other) = plugins.iter().find(|plugin| {
+        plugin.id != id && toml_support::normalize_package_name(&plugin.group) == name
+    }) {
+        return Err(AppError::usage(format!(
+            "dependency group {name} is shared by nodes {id} and {}",
+            other.id
+        )));
+    }
     Ok(())
 }
 

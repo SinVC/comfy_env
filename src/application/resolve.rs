@@ -1,29 +1,26 @@
 use crate::cli::ResolveArgs;
-use crate::domain::{AppError, AppResult, ProjectRoot, TxId, TxStatus};
-use crate::{dependency_sync, platform, state_ledger, toml_support};
+use crate::domain::{AppError, AppResult, GroupName, ProjectRoot, TxId, TxKind, TxStatus};
+use crate::{dependency_sync, platform, state_ledger};
 use std::io::{self, Write};
 
 pub fn cmd_resolve(args: ResolveArgs, root: &ProjectRoot) -> AppResult<()> {
     let mut tx = state_ledger::load_transaction(root, &TxId(args.tx_id))?;
-    if tx.kind != "plugin" || tx.status != Some(TxStatus::NeedsResolution) {
+    if tx.kind != TxKind::Plugin || tx.status != Some(TxStatus::NeedsResolution) {
         return Err(AppError::usage(
             "resolve requires a plugin transaction needing resolution",
         ));
     }
     let (config, uv) = super::configured_uv(root)?;
-    let plugin = state_ledger::load_plugins(root)?
-        .into_iter()
+    let plugins = state_ledger::load_plugins(root)?;
+    let plugin = plugins
+        .iter()
         .find(|p| tx.node_id.as_deref() == Some(&p.id))
         .ok_or_else(|| AppError::usage("transaction plugin is no longer registered"))?;
+    super::node::validate_group_owner(&plugins, &plugin.group, &plugin.id)?;
+    tx.plugin_group = Some(GroupName(plugin.group.clone()));
     let mut pins = args.pins;
     if let Some(file) = args.pins_file {
-        pins.extend(
-            std::fs::read_to_string(file)?
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_owned),
-        );
+        pins.extend(super::pin::read_pins_file(&file)?);
     }
     if pins.is_empty() {
         if let Some(conflict) = state_ledger::load_conflict(root, &TxId(tx.id.clone()))? {
@@ -40,34 +37,20 @@ pub fn cmd_resolve(args: ResolveArgs, root: &ProjectRoot) -> AppResult<()> {
             pins.push(line.trim().to_string());
         }
     }
-    if pins.is_empty() {
-        return Err(AppError::usage("at least one resolution pin is required"));
-    }
-    for pin in &pins {
-        if !toml_support::is_exact_pin(pin) {
-            return Err(AppError::usage(format!("invalid resolution pin: {pin}")));
-        }
-    }
-    for pin in pins {
-        let name = toml_support::normalize_package_name(&pin);
-        tx.resolution_pins
-            .retain(|old| toml_support::normalize_package_name(old) != name);
-        tx.resolution_pins.push(pin);
-    }
+    super::pin::merge_resolution_pins(&mut tx, pins, args.override_requirements)?;
     let old_stage = platform::from_state_path(&tx.staged_workdir);
+    let baseline = super::tx::truth_hashes(root.as_path())?;
     let stage = dependency_sync::create_staged_workdir(root)?;
+    tx.staged_workdir = platform::to_state_path(stage.path());
+    super::tx::begin_observation(root, &mut tx, baseline)?;
     let stage_path = stage.persist();
-    tx.staged_workdir = platform::to_state_path(&stage_path);
-    state_ledger::save_transaction(root, &tx)?;
-    let locked = super::tx::stage_plugin(
+    let locked = super::tx::stage_transaction(
         &stage_path,
-        &plugin.group,
-        &tx.observed_requirements.clone(),
-        &tx.resolution_pins.clone(),
+        &GroupName(plugin.group.clone()),
         &uv,
         root,
         &mut tx,
-    )?;
+    );
     if old_stage != stage_path && old_stage.exists() {
         if let Err(error) =
             super::tx::remove_tx_artifact(&platform::to_state_path(&old_stage), &root.work_dir())
@@ -75,8 +58,20 @@ pub fn cmd_resolve(args: ResolveArgs, root: &ProjectRoot) -> AppResult<()> {
             eprintln!("warning: failed to clean old stage: {error}");
         }
     }
+    let locked = match locked {
+        Ok(locked) => locked,
+        Err(error) => {
+            super::tx::mark_failed(root, &mut tx, &error)?;
+            return Err(error.into());
+        }
+    };
     if !locked {
         println!("Transaction still needs resolution: {}", tx.id);
+        if !args.override_requirements {
+            println!(
+                "Use --override-requirements to explicitly override incompatible requirements."
+            );
+        }
         return Ok(());
     }
     super::tx::observe_candidate(

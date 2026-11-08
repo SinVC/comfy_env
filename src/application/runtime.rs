@@ -41,6 +41,7 @@ pub fn cmd_run(args: RunArgs, root: &ProjectRoot) -> AppResult<i32> {
         &extra_args,
         &root.pid_file(),
         || {
+            crate::safety_guards::ensure_production_recoverable(root)?;
             if sync {
                 let python = config
                     .runtime

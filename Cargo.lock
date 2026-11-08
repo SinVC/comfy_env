@@ -284,7 +284,6 @@ dependencies = [
  "thiserror",
  "time",
  "toml_edit",
- "wait-timeout",
  "windows-sys",
 ]
 

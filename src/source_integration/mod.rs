@@ -1,10 +1,9 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::domain::CmdResult;
+use crate::domain::{CmdResult, NodeId};
 
 pub struct GitClient;
 
@@ -53,48 +52,14 @@ pub fn node_id_from_url(url: &str) -> String {
         .to_string()
 }
 
-pub fn plugin_install_path(comfyui_dir: &Path, node_id: &str) -> PathBuf {
-    comfyui_dir.join("custom_nodes").join(node_id)
+pub fn plugin_install_path(comfyui_dir: &Path, node_id: &NodeId) -> PathBuf {
+    comfyui_dir.join("custom_nodes").join(&node_id.0)
 }
 
 pub fn remove_plugin_source(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    for entry in walkdir(path)? {
-        let metadata = fs::metadata(&entry)?;
-        if metadata.is_file() && metadata.permissions().readonly() {
-            let mut permissions = metadata.permissions();
-            permissions.set_readonly(false);
-            fs::set_permissions(&entry, permissions)?;
-        }
-    }
-    fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
+    crate::fs_support::remove_tree(path)
 }
 
 pub fn copy_plugin_source(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let target = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_plugin_source(&entry.path(), &target)?;
-        } else {
-            crate::fs_support::copy_file(&entry.path(), &target)?;
-        }
-    }
-    Ok(())
-}
-
-fn walkdir(path: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            paths.extend(walkdir(&entry.path())?);
-        } else {
-            paths.push(entry.path());
-        }
-    }
-    Ok(paths)
+    crate::fs_support::copy_tree_preserving_links(src, dst)
 }

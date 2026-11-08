@@ -1,70 +1,27 @@
-# resolve (Plugin Conflict Resolution)
+# Plugin conflict resolution
 
-**Implementation target:** [src/application/resolve.rs](../../src/application/resolve.rs)
-
-## Synopsis
+[Implementation](../../src/application/resolve.rs)
 
 ```
-gov resolve <txid> [--pin <pkg==version>]...
+gov resolve <txid> [--pin <pkg==version>]... [--pins-file <path>] [--override-requirements]
 ```
 
-## Purpose
+Requires a registered plugin transaction in `needs_resolution`. Provide one or
+more exact pins through repeatable flags or a file with one pin per line.
+Blank lines and comments in the file are ignored. Without pins, gov prints the
+conflict summary and prompts for one pin per line until a blank line or EOF.
 
-Resolve a lock conflict in a plugin transaction by providing additional pins. Unlike `update resolve`, this command also supports interactive input (prompts for pins if none provided via flags).
+Merge pins by normalized package name with the last value winning. Stage from
+current production truth, then apply the node's recorded requirements and the
+resolution pins. A normal pin adds a constraint in
+`dependency-groups.overrides`. Use `--override-requirements` to also write the
+pins from this invocation to `tool.uv.override-dependencies`. The Torch family
+is managed by `gov install torch`.
 
-## Arguments
-
-| Flag | Required | Description |
-|------|----------|-------------|
-| `<txid>` | Yes | Transaction to resolve |
-| `--pin` | No | Pin specs (repeatable) |
-
-If no `--pin` flags provided, enters interactive mode: displays conflict summary and prompts for `pkg==version` entries (one per line, empty line to finish).
-
-## Preconditions
-
-- Transaction must exist with status `needs_resolution`
-- Transaction kind must be `plugin`
-
-## Reads
-
-- `state/transactions/<txid>.json`
-- `state/conflicts/<txid>.json` — conflict report (for display)
-- `pyproject.toml`, `uv.lock` — current truth
-
-## Writes
-
-- `state/transactions/<txid>.json` — resolution_pins merged, status may change
-- `state/work/<workdir>/` — re-staged with resolution pins
-
-## Success Path
-
-```
-1. Load transaction record
-2. Verify status == "needs_resolution" and kind == "plugin"
-3. Collect pins:
-   a. From --pin flags if provided
-   b. ELSE: display conflict summary, prompt user for pins interactively
-4. Merge new pins into transaction's resolution_pins (last-wins dedup)
-5. Copy truth to staged workdir
-6. Apply original plugin deps + all resolution pins to workdir:
-   - Re-add plugin group entries
-   - Add/update resolution pins in overrides group
-7. Lock workdir: `uv lock --python <py>`
-8. IF lock succeeds:
-   - Sync and observe the resolved candidate and refresh diff/core_impact before marking it resolved. A candidate setup failure stays failed.
-9. IF lock fails:
-   - Write updated conflict artifact
-   - tx remains "needs_resolution"
-   - Display updated conflict info
-```
-
-## Failure Path
-
-No backup/restore needed — `resolve` only mutates the staged workdir and transaction record, not production truth.
-
-## Compatibility Notes
-
-- Bash era: interactive mode reads from stdin line-by-line
-- Rust era: same interactive behavior preserved; non-interactive mode uses `--pin` flags
-- Future consideration: `--pins-file` flag for consistency with `update resolve`
+Before locking the new stage, invalidate the earlier observation and record
+this invocation as owner. If the lock conflicts, keep the updated report in
+`needs_resolution` and offer the explicit force flag when appropriate. When
+the lock succeeds, sync and observe the candidate again. A passed observation
+becomes `resolved`. Failed observations retain their own outcome and logs.
+Forced overrides still require the same snapshot checks and core approval at
+[promotion](tx.md). Production truth is unchanged until promotion.

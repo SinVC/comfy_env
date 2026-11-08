@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -119,6 +117,33 @@ pub struct NodeId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct GroupName(pub String);
+
+pub const TORCH_FAMILY: [&str; 3] = ["torch", "torchvision", "torchaudio"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TxKind {
+    Plugin,
+    CoreUpdate,
+    #[serde(untagged)]
+    Historical(String),
+}
+
+impl Default for TxKind {
+    fn default() -> Self {
+        Self::Historical(String::new())
+    }
+}
+
+impl Display for TxKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Plugin => "plugin",
+            Self::CoreUpdate => "core_update",
+            Self::Historical(value) => value,
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

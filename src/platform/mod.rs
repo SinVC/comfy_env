@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -10,9 +8,36 @@ mod process;
 #[path = "process_windows.rs"]
 mod process;
 
+#[cfg(windows)]
+pub use process::keep_launcher_alive_on_break;
 pub use process::{
-    RunInterrupts, check_process_alive, configure_prod_process, exit_code, terminate_process,
+    CandidateProcess, RunInterrupts, check_process_alive, exit_code, process_creation,
+    terminate_process,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub creation: String,
+}
+
+impl ProcessIdentity {
+    pub fn capture(pid: u32) -> anyhow::Result<Self> {
+        let creation = process_creation(pid)?.ok_or_else(|| {
+            anyhow::anyhow!("process {pid} exited before its identity was recorded")
+        })?;
+        Ok(Self { pid, creation })
+    }
+
+    pub fn is_alive(&self) -> anyhow::Result<bool> {
+        Ok(check_process_alive(self.pid)?
+            && process_creation(self.pid)?.as_ref() == Some(&self.creation))
+    }
+
+    pub fn candidate_is_alive(&self) -> anyhow::Result<bool> {
+        process::candidate_is_alive(self)
+    }
+}
 
 pub struct PythonClient;
 
@@ -39,7 +64,7 @@ impl PythonClient {
             .args([
                 "-B",
                 "-c",
-                "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')",
+                "import platform; print(platform.python_version())",
             ])
             .output()?;
         let result = crate::domain::CmdResult::from_output(output);
@@ -82,10 +107,6 @@ pub fn from_state_path(path: &str) -> PathBuf {
     {
         PathBuf::from(path)
     }
-}
-
-pub fn is_process_alive(pid: u32) -> bool {
-    check_process_alive(pid).unwrap_or(false)
 }
 
 pub fn sys_platform() -> &'static str {

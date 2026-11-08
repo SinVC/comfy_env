@@ -52,7 +52,7 @@ fn list_transactions() -> Result<Vec<TransactionRecord>>
 
 **Invariants**:
 - `txid` is immutable once created
-- Core updates record `base_truth_sha256` when staging. For an older transaction with no recorded baseline, start a fresh update before promotion.
+- Both kinds record `base_truth_sha256` and `staged_truth_sha256` for the same observation. A retry clears the previous observation before staging. Old records without this evidence remain readable and abortable.
 - Observation fields are populated after candidate execution and refreshed after resolution. The recorded production baseline stays fixed.
 - `candidate_env` and `staged_workdir` retain their original path strings even if the referenced directories are later cleaned after `promote` or `abort`
 - Read path must tolerate missing optional fields (schema evolution)
@@ -65,7 +65,8 @@ fn list_transactions() -> Result<Vec<TransactionRecord>>
 - `pre_freeze`, `post_freeze`, `diff`, `core_impact`, `logs`, `ended_at`, `status` update
 
 **Fields populated during promote/resolve**:
-- `resolution_pins` (resolve), `promotion` (promote), `conflict_report` (lock failure)
+- `resolution_pins` and optional `resolution_overrides` (resolve), `promotion` (promote), `conflict_report` (lock failure)
+- Optional owner and candidate identities support stale cleanup. The optional observation records outcome, pre-run candidate freeze, package drift and node load failures. `attempt` distinguishes retry logs.
 - Inspect/read layers may annotate missing artifact paths as `(cleaned)` for promoted/aborted transactions or `(missing)` for other states, but they do not rewrite the stored JSON fields
 
 ### 2. Operation Records
@@ -83,7 +84,7 @@ fn prune_operations(retention_count: u32) -> Result<u32>
 ```json
 {
   "op_id": "20260419T120000Z-op-e5f6a7b8",
-  "kind": "install_torch|install_core|pin_add|pin_remove|node_remove|plugin_promote|core_promote|update_promote|env_import|manual_undo",
+  "kind": "install_torch|install_core|pin_add|pin_remove|node_remove|plugin_promote|core_promote|update_promote|env_import|manual_undo|reinit",
   "reference": "txid or node_id or description",
   "status": "running|success|failed|undone",
   "started_at": "ISO8601",
@@ -104,6 +105,14 @@ fn prune_operations(retention_count: u32) -> Result<u32>
 - `status` transitions: `running` → `success`|`failed`, `success` → `undone`
 - Backup directory is co-located: `state/ops/<op_id>/backup/`
 - Following a successful mutation or undo, prune the oldest finished operations by start time beyond retention_count (default 100, minimum 1). Keep running records and report pruning errors as warnings.
+
+The optional `recovery` payload records the owner, active external process,
+phase, touched source and environment, linked transaction or undo target, and
+separate apply and restore errors. Applying and restore-failed operations
+retain backups. A committed operation can remain pending while a ledger link
+needs repair. Old running operations without a recovery payload require manual
+inspection. Batch queries and pruning warn and skip damaged records. Exact
+reads and production recovery remain strict.
 
 ### 3. Plugin Registry
 
@@ -135,7 +144,7 @@ fn update_plugin(node_id: &NodeId, update: PluginUpdate) -> Result<()>
 **Invariants**:
 - `id` is unique within the array
 - `install_relpath` uses forward slashes (platform-normalized via `platform/`)
-- `managed_deps` is informational only — it records which packages were added to the plugin's dependency group during promote. It is NOT authoritative for dependencies; `pyproject.toml` dependency-groups is the source of truth. `managed_deps` exists for display purposes (`status`, `op inspect`) and to assist `node remove` in knowing which packages to clean up.
+- `managed_deps` is informational only — it records which packages were added to the plugin's dependency group during promote. The declared dependency group in `pyproject.toml` is authoritative. The ledger records a unique normalized group owner per node. Node removal uses that group and preserves global pins.
 
 ### 4. Conflict Artifacts
 

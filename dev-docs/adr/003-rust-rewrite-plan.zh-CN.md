@@ -300,9 +300,9 @@ hint: cross-platform import is not supported in v1
 
 ### custom_nodes handling (`custom_nodes` 处理)
 
-- `env import` 会删除 bundle 中不存在的 `custom_nodes/*` 目录（与当前行为一致）。
-- 在 Windows 上，如果某个 `custom_nodes/*` 条目是 junction 或 symlink，`env import` 会跳过删除并给出警告。它不会跟随或删除链接目标。
-- 对现有 `custom_nodes` 的备份通过 `fs_support::dir_copy()` 完成；当遇到 symlink 时，复制的是链接本身，而不是目标。
+- Bundle v1 替换包内普通节点目录，并移除额外的普通节点目录。顶层普通文件、符号链接和 junction 保留。包内节点与普通文件同名时拒绝导入。与链接同名时保留链接并警告该节点源码已跳过。
+- 导入在同卷且不被 ComfyUI 扫描的位置暂存新节点，并在每次移动前写入恢复日志。回滚按相反顺序撤销已执行的移动。移动原目录可保留内部链接与 junction。
+- uv 使用目标解释器的完整版本和 marker 环境判定兼容性。清单单独核对平台和架构。见 [env import](../commands/env.md)。
 
 ## TOML Editing Rules (TOML 编辑规则)
 

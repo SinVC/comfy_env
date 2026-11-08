@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,7 +6,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339, macros::form
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{OpId, OpStatus, ProjectRoot, TxId, TxStatus};
+use crate::domain::{GroupName, OpId, OpStatus, ProjectRoot, TxId, TxKind, TxStatus};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginRecord {
@@ -37,7 +35,7 @@ pub struct TransactionRecord {
     #[serde(default, rename = "txid", alias = "id")]
     pub id: String,
     #[serde(default)]
-    pub kind: String,
+    pub kind: TxKind,
     #[serde(default)]
     pub status: Option<TxStatus>,
     #[serde(default)]
@@ -48,6 +46,8 @@ pub struct TransactionRecord {
     pub updated_at: Option<String>,
     #[serde(default)]
     pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_group: Option<GroupName>,
     #[serde(default)]
     pub candidate_env: String,
     #[serde(default)]
@@ -66,6 +66,8 @@ pub struct TransactionRecord {
     pub conflict_report: Option<String>,
     #[serde(default)]
     pub resolution_pins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolution_overrides: Vec<String>,
     #[serde(default)]
     pub promotion: Option<PromotionRecord>,
     #[serde(default)]
@@ -80,6 +82,37 @@ pub struct TransactionRecord {
     pub source_requirements_path: Option<String>,
     #[serde(default)]
     pub source_requirements_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::platform::ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_process: Option<crate::platform::ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<Observation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Observation {
+    pub outcome: ObservationOutcome,
+    pub candidate_before: Vec<String>,
+    pub package_drift: PackageDiff,
+    pub node_failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationOutcome {
+    SyncFailed,
+    InfrastructureFailed,
+    ProbeUnsupported,
+    ProbeIncomplete,
+    NodeLoadFailed,
+    NonzeroExit,
+    TimedOut,
+    Interrupted,
+    PackageDrift,
+    Passed,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -98,6 +131,8 @@ pub struct TransactionLogs {
     pub run_exit_code: Option<i32>,
     #[serde(default)]
     pub timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +179,7 @@ pub enum OpKind {
     CorePromote,
     EnvImport,
     ManualUndo,
+    Reinit,
     #[serde(untagged)]
     Historical(String),
 }
@@ -160,6 +196,7 @@ impl std::fmt::Display for OpKind {
             Self::CorePromote => "core_promote",
             Self::EnvImport => "env_import",
             Self::ManualUndo => "manual_undo",
+            Self::Reinit => "reinit",
             Self::Historical(kind) => kind,
         };
         f.write_str(value)
@@ -193,6 +230,66 @@ pub struct OperationRecord {
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<OperationRecovery>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationPhase {
+    Prepared,
+    Applying,
+    Committed,
+    RestoreFailed,
+    Restored,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationRecovery {
+    pub phase: OperationPhase,
+    pub owner: crate::platform::ProcessIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_process: Option<crate::platform::ProcessIdentity>,
+    pub source_touched: bool,
+    pub sync: Option<EnvironmentRecovery>,
+    pub link: Option<OperationLink>,
+    pub linked: bool,
+    pub apply_error: Option<String>,
+    pub restore_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentRecovery {
+    pub path: String,
+    pub existed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OperationLink {
+    Promotion {
+        tx_id: TxId,
+        reason: Option<String>,
+        keep_artifacts: bool,
+    },
+    Undo {
+        op_id: OpId,
+    },
+}
+
+impl OperationRecord {
+    pub fn needs_recovery(&self) -> bool {
+        match &self.recovery {
+            None => self.status == OpStatus::Running,
+            Some(recovery) => match recovery.phase {
+                OperationPhase::Prepared
+                | OperationPhase::Applying
+                | OperationPhase::RestoreFailed => true,
+                OperationPhase::Committed => recovery.link.is_some() && !recovery.linked,
+                OperationPhase::Restored => false,
+            },
+        }
+    }
 }
 
 // Early Rust records used Unix seconds with a millisecond fraction and a Z suffix.
@@ -271,7 +368,7 @@ pub fn write_conflict(root: &ProjectRoot, tx: &TransactionRecord, raw: &str) -> 
         raw_log: crate::platform::to_state_path(&log),
         summary: raw.lines().take(40).collect::<Vec<_>>().join("\n"),
         detected_packages: detect_conflict_packages(raw),
-        input_hint: if tx.kind == "core_update" {
+        input_hint: if tx.kind == TxKind::CoreUpdate {
             format!("Use: gov update resolve {} --pin pkg==version", tx.id)
         } else {
             format!("Use: gov resolve {} --pin pkg==version", tx.id)
@@ -317,6 +414,14 @@ pub fn load_conflict(root: &ProjectRoot, id: &TxId) -> Result<Option<ConflictRep
 }
 
 pub fn load_transactions(root: &ProjectRoot) -> Result<Vec<TransactionRecord>> {
+    read_transactions(root, true)
+}
+
+pub fn list_transactions(root: &ProjectRoot) -> Result<Vec<TransactionRecord>> {
+    read_transactions(root, false)
+}
+
+fn read_transactions(root: &ProjectRoot, strict: bool) -> Result<Vec<TransactionRecord>> {
     let dir = root.transactions_dir();
     if !dir.exists() {
         return Ok(Vec::new());
@@ -333,11 +438,16 @@ pub fn load_transactions(root: &ProjectRoot) -> Result<Vec<TransactionRecord>> {
             continue;
         }
 
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let record = serde_json::from_str::<TransactionRecord>(&text)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        records.push(record);
+        let result = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .context("invalid transaction filename")
+            .and_then(|name| load_transaction(root, &TxId(name.to_owned())));
+        match result {
+            Ok(record) => records.push(record),
+            Err(error) if strict => return Err(error),
+            Err(error) => eprintln!("warning: skipping {}: {error:#}", path.display()),
+        }
     }
 
     records.sort_by(|left, right| right.sort_key().cmp(&left.sort_key()));
@@ -376,6 +486,10 @@ pub fn save_operation(root: &ProjectRoot, op: &OperationRecord) -> Result<()> {
 }
 
 pub fn list_operations(root: &ProjectRoot) -> Result<Vec<OperationRecord>> {
+    read_operations(root, false)
+}
+
+fn read_operations(root: &ProjectRoot, strict: bool) -> Result<Vec<OperationRecord>> {
     let dir = root.ops_dir();
     if !dir.exists() {
         return Ok(Vec::new());
@@ -392,19 +506,19 @@ pub fn list_operations(root: &ProjectRoot) -> Result<Vec<OperationRecord>> {
             continue;
         }
         let path = entry.path().join("meta.json");
-        if !path.exists() {
+        if !path.try_exists()? {
             continue;
         }
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let record = serde_json::from_str::<OperationRecord>(&text)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        ensure!(
-            entry.file_name() == std::ffi::OsStr::new(&record.op_id),
-            "operation ID differs from its directory: {}",
-            path.display()
-        );
-        operations.push(record);
+        let result = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow!("invalid operation directory name"))
+            .and_then(|name| load_operation(root, &OpId(name)));
+        match result {
+            Ok(record) => operations.push(record),
+            Err(error) if strict => return Err(error),
+            Err(error) => eprintln!("warning: skipping {}: {error:#}", path.display()),
+        }
     }
 
     operations.sort_by_cached_key(|op| std::cmp::Reverse(operation_time(&op.started_at)));
@@ -414,13 +528,17 @@ pub fn list_operations(root: &ProjectRoot) -> Result<Vec<OperationRecord>> {
 pub fn prune_operations(root: &ProjectRoot, retention_count: usize) -> Result<()> {
     let completed = list_operations(root)?
         .into_iter()
-        .filter(|op| op.status != OpStatus::Running);
+        .filter(|op| !op.needs_recovery());
     for op in completed.skip(retention_count.max(1)) {
         let directory = root.ops_dir().join(op.op_id);
-        fs::remove_dir_all(&directory)
+        crate::fs_support::remove_tree(&directory)
             .with_context(|| format!("failed to prune {}", directory.display()))?;
     }
     Ok(())
+}
+
+pub fn operations_for_recovery(root: &ProjectRoot) -> Result<Vec<OperationRecord>> {
+    read_operations(root, true)
 }
 
 pub fn mark_operation_undone(

@@ -4,6 +4,7 @@ pub mod install;
 pub mod node;
 pub mod ops;
 pub mod pin;
+mod production;
 pub mod resolve;
 pub mod runtime;
 pub mod status;
@@ -17,11 +18,31 @@ use crate::cli::{
 };
 use crate::dependency_sync::UvClient;
 use crate::domain::{AppError, AppResult, OpId, ProjectRoot};
-use crate::safety_guards;
 use crate::toml_support::{self, RuntimeConfig};
 
 pub fn dispatch(cli: Cli) -> AppResult<i32> {
     let root = ProjectRoot::discover()?;
+    if matches!(
+        &cli.command,
+        Commands::Init(_)
+            | Commands::Install(_)
+            | Commands::Undo(_)
+            | Commands::Node(_)
+            | Commands::Pin(crate::cli::PinArgs {
+                command: PinSubcommand::Add(_) | PinSubcommand::Remove(_)
+            })
+            | Commands::Tx(crate::cli::TxArgs {
+                command: TxSubcommand::Promote(_)
+            })
+            | Commands::Update(crate::cli::UpdateArgs {
+                command: UpdateSubcommand::Promote(_)
+            })
+            | Commands::Env(crate::cli::EnvArgs {
+                command: EnvSubcommand::Import(_)
+            })
+    ) {
+        crate::runtime_executor::ensure_prod_stopped(&root.pid_file())?;
+    }
 
     match cli.command {
         Commands::Init(args) => init::cmd_init(args, &root),
@@ -33,7 +54,7 @@ pub fn dispatch(cli: Cli) -> AppResult<i32> {
         },
         Commands::Pin(args) => match args.command {
             PinSubcommand::Add(add_args) => pin::cmd_pin_add(add_args, &root),
-            PinSubcommand::List => pin::cmd_pin_list(&root),
+            PinSubcommand::List(list_args) => pin::cmd_pin_list(list_args, &root),
             PinSubcommand::Remove(remove_args) => pin::cmd_pin_remove(remove_args, &root),
         },
         Commands::Node(args) => match args.command {
@@ -67,6 +88,9 @@ pub fn dispatch(cli: Cli) -> AppResult<i32> {
         Commands::Op(args) => match args.command {
             OpSubcommand::List => ops::cmd_op_list(&root),
             OpSubcommand::Inspect(inspect_args) => ops::cmd_op_inspect(inspect_args, &root),
+            OpSubcommand::Recover(recover_args) => {
+                production::recover(&root, &OpId(recover_args.op_id))
+            }
         },
         Commands::Undo(args) => undo::cmd_undo(args, &root),
         Commands::Run(args) => return runtime::cmd_run(args, &root),
@@ -77,8 +101,7 @@ pub fn dispatch(cli: Cli) -> AppResult<i32> {
 }
 
 fn configured_uv(root: &ProjectRoot) -> AppResult<(RuntimeConfig, UvClient)> {
-    let config = toml_support::read_config(&root.config_toml())?
-        .ok_or_else(|| AppError::usage("config.toml is required"))?;
+    let config = configured(root)?;
     let python = config
         .runtime
         .python
@@ -89,22 +112,9 @@ fn configured_uv(root: &ProjectRoot) -> AppResult<(RuntimeConfig, UvClient)> {
     Ok((config, uv))
 }
 
-fn rollback_failed_operation(
-    root: &ProjectRoot,
-    op_id: &OpId,
-    config: &RuntimeConfig,
-    uv: &UvClient,
-    error: anyhow::Error,
-) -> AppError {
-    let mut note = format!("{error:#}");
-    let rollback = safety_guards::op_restore(op_id, root).and_then(|_| uv.sync_prod(root, config));
-    if let Err(error) = rollback {
-        note.push_str(&format!("; rollback failed: {error:#}"));
-    }
-    if let Err(error) = safety_guards::op_finalize(op_id, false, Some(note.clone()), root) {
-        note.push_str(&format!("; failed to record operation failure: {error:#}"));
-    }
-    AppError::runtime(note)
+fn configured(root: &ProjectRoot) -> AppResult<RuntimeConfig> {
+    toml_support::read_config(&root.config_toml())?
+        .ok_or_else(|| AppError::usage("config.toml is required"))
 }
 
 fn prune_history(root: &ProjectRoot, config: &RuntimeConfig) {

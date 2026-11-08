@@ -4,6 +4,8 @@
 
 ## `node add`
 
+The normalized group name must be unique among registered nodes. A collision such as `foo_bar` and `foo-bar` blocks the second registration before cloning. Existing unowned or shared groups require operator resolution.
+
 ### Synopsis
 
 ```
@@ -78,6 +80,8 @@ IF git checkout fails: clean up cloned directory, exit
 ---
 
 ## `node remove`
+
+A shared normalized group blocks removal and identifies both owners. Global pins remain in their own group. A live managed production process blocks source and dependency writes.
 
 ### Synopsis
 

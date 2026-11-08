@@ -45,7 +45,8 @@ Nothing.
    - Count by status. Pending includes all recorded states except promoted and aborted; report core_update pending separately.
    - List last 8 transactions (txid, kind, status, subject, timestamp)
 5. Report running status:
-   - PID file exists? Process alive?
+   - Check whether the recorded PID and creation identity are live.
+   - Report pending operation recovery IDs.
 6. Print formatted summary to stdout
 ```
 

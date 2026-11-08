@@ -47,7 +47,10 @@ Rules:
 7. `env export` / `env import` bundles are transport artifacts; after import, local truth remains `pyproject.toml + uv.lock`.
 8. Bundle source snapshots exclude VCS admin metadata (`.git/`).
 9. The Rust binary is the sole entry point. No shell wrappers or dispatchers in the product.
-10. Cross-platform behavior is defined at the product semantics level, not left as implementation detail.
+10. Linux and Windows share the same command and recovery contracts.
+11. Production writes are serialized. A managed ComfyUI process and unresolved production recovery each gate writes. The PID lock coordinates runtime launch, stop and cleanup.
+12. Promotion applies the observed lock after validating production truth, staged truth and the actual production package set. The current core policy controls approval.
+13. An operation commits in its ledger before linking a promotion or undo. Recover an interrupted write or missing link through `gov op recover`.
 
 ## Module Map
 
@@ -74,14 +77,14 @@ src/
 **Transaction lifecycle:**
 
 Valid transitions:
-- `running` → `completed` | `failed` | `needs_resolution`
-- `completed` → `promoted` | `promote_failed` | `needs_resolution` | `aborted`
-- `failed` → `promoted` | `promote_failed` | `needs_resolution` | `aborted`
-- `needs_resolution` → `resolved` | `failed` | `aborted`
-- `resolved` → `promoted` | `needs_resolution` | `promote_failed` | `aborted`
+- `running` → `completed` | `failed` | `needs_resolution` | `aborted`
+- `completed` → `promoted` | `promote_failed` | `aborted`
+- `failed` → `promoted` | `promote_failed` | `aborted`
+- `needs_resolution` → `running` | `aborted`
+- `resolved` → `promoted` | `promote_failed` | `aborted`
 - `promote_failed` → `aborted`
 
-Note: `running` → `needs_resolution` occurs when lock fails during `tx run` staging (before ComfyUI executes). `running` → `completed` includes both exit code 0 and bounded observation timeout. `completed` / `resolved` / `failed` → `needs_resolution` occurs when lock fails during plugin promotion. Core-update promotion uses the previously locked snapshot.
+An initial verified startup probe completes the transaction. A verified probe during resolve yields `resolved`. Timeout is a failed outcome. Only a failed observation with a real nonzero runtime exit after successful candidate sync can be explicitly approved. Old records without snapshot evidence must be observed again. Stale `running` records can be aborted after checking process identities.
 
 **Operation lifecycle:**
 
@@ -89,6 +92,8 @@ Note: `running` → `needs_resolution` occurs when lock fails during `tx run` st
 running → success | failed
 success → undone (via undo command)
 ```
+
+The append-only recovery payload distinguishes prepared, applying, committed, restored, and restore-failed operations. A committed operation may need its ledger link repaired. Pending recovery keeps the backup and blocks later production writes.
 
 ### Type Definitions
 
@@ -123,7 +128,7 @@ success → undone (via undo command)
 | Runtime liveness hint | `state/comfyui.pid` | state dir |
 | Logs | `state/logs/*` | state dir |
 
-`state/comfyui.pid` is an operational hint, not a durable source of truth; runtime liveness must always be confirmed against the host process layer.
+`state/comfyui.pid` holds the PID and host creation identity. Verify both before signaling. Old live numeric records require operator verification.
 
 ## External Tool Contracts
 
@@ -148,7 +153,7 @@ All tool invocations go through client structs that return `CmdResult`. No raw `
 ## Key Flows
 
 1. **Plugin onboarding**: `node add` → `tx run` → `tx inspect` → `tx promote`
-2. **Lock conflict resolution**: promote fails → `resolve` with pins → re-promote
+2. **Lock conflict resolution** — staged lock fails → `resolve` with pins → observe → promote
 3. **Plugin removal + undo**: `node remove` → `undo` with backup restore
 4. **Bootstrap**: `init` → `install torch` → `install` → `update run` → `update promote`
 5. **Environment transfer**: `env export` → `env import` (same platform only in v1)

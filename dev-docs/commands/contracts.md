@@ -42,6 +42,6 @@ Individual command docs reference these protocols by name (e.g. "Execute [Staged
 | Conflict resolution | `resolve` | [resolve.md](resolve.md) |
 | Updates | `update run`, `update inspect`, `update abort`, `update promote`, `update resolve` | [update.md](update.md) |
 | Environment | `env export`, `env import` | [env.md](env.md) |
-| Operations | `op list`, `op inspect`, `undo` | [ops.md](ops.md) |
+| Operations | `op list`, `op inspect`, `op recover`, `undo` | [ops.md](ops.md) |
 | Runtime | `run`, `stop` | [runtime.md](runtime.md) |
 | Status | `status`, `help` | [status.md](status.md) |

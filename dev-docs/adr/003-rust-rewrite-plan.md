@@ -300,9 +300,9 @@ Paths inside `manifest.json` use forward slashes regardless of export platform. 
 
 ### custom_nodes handling
 
-- `env import` removes `custom_nodes/*` directories not present in the bundle (same as current behavior).
-- On Windows, if a `custom_nodes/*` entry is a junction or symlink, `env import` skips deletion and warns. It does not follow or delete link targets.
-- Backup of existing `custom_nodes` uses `fs_support::dir_copy()` which handles symlinks by copying the link, not the target.
+- Bundle v1 replaces bundled ordinary node directories and removes extra ordinary directories. It preserves top-level ordinary files, symlinks and junctions. A same-name file blocks import. A same-name link is preserved with a warning that the bundled source was skipped.
+- Import stages new nodes outside the scanned tree on the same volume and journals each directory move before it runs. Rollback reverses the recorded moves. The original directory moves preserve nested links and junctions.
+- The exact target interpreter evaluates Python version constraints and environment markers through uv. The manifest checks platform and architecture separately. See [env import](../commands/env.md).
 
 ## TOML Editing Rules
 

@@ -30,7 +30,7 @@
 
 1. 所有生产依赖变更都必须先锚定到本地真相文件 `pyproject.toml` 和 `uv.lock`，之后才可应用到 `.venv-prod`。
 2. 事务是插件依赖影响在提升前唯一受支持的观察单元。
-3. 破坏性状态变更（`promote`、`remove`、`undo`）在最终完成前，必须创建或使用操作备份。
+3. 生产变更在首次写入前备份并记录恢复依据。同一项目的生产写入串行执行。运行中的纳管 ComfyUI 和待恢复操作都会阻止生产写入。
 4. 锁文件冲突必须以显式冲突产物和可解析事务状态的形式暴露，而不是静默部分成功。
 5. 核心包漂移受策略门控约束，未经显式批准不得提升。
 6. `state/plugins.json` 是注册表元数据；`pyproject.toml` 中 dependency-group 的内容才是实际依赖的权威来源。
@@ -57,6 +57,14 @@ src/
 └── fs_support/             → 原子写入、哈希、路径规范化、目录操作
 ```
 
+## 观察、晋升与恢复
+
+候选必须完成 ComfyUI 的原生启动探针。插件事务还需要准确的目标节点加载证据。超时、导入失败和包集漂移会阻止晋升。只有本次同步成功后的真实非零退出可以显式批准。重新暂存前先作废上次观察。
+
+两个晋升入口共用同一套检查。它们核对生产和暂存真相的哈希、实际生产包集，并以当前核心包策略判断审批。晋升直接使用已观察的锁。旧事务缺少这些证据时，先重跑或重新 resolve。
+
+操作账本在生产同步、冒烟和元数据写入成功后先记录提交，再更新晋升或撤销的关联。`gov op recover <op_id>` 恢复中断的生产写入，或补记已提交操作的关联。恢复失败保留备份和错误。`tx abort` 和 `update abort` 会检查事务所有者与候选的身份后再清理。旧运行中事务需要人工核实并提供 `--confirm-stopped`。
+
 ## 数据主权
 
 | 域 | 真相来源 | 位置 |
@@ -67,7 +75,7 @@ src/
 | 事务 | `state/transactions/*.json` | state 目录 |
 | 操作 | `state/ops/<op_id>/meta.json` + `backup/` | state 目录 |
 | 冲突 | `state/conflicts/*.json` | state 目录 |
-| 运行时存活状态 | `state/comfyui.pid` | state 目录 |
+| 运行时 PID 与宿主进程创建身份 | `state/comfyui.pid` | state 目录 |
 | 日志 | `state/logs/*` | state 目录 |
 
 ## External Tool Contracts (外部工具契约)
@@ -85,7 +93,7 @@ src/
 完整细节见 ADR-003 第 Platform Abstraction（平台抽象）节。摘要如下：
 
 - Venv Python: Linux 为 `<venv>/bin/python`，Windows 为 `<venv>/Scripts/python.exe`
-- 进程终止: Linux 为 SIGTERM→SIGKILL，Windows 为 TerminateProcess
+- Linux 通过 PID 文件描述符发送 SIGTERM，超时后发送 SIGKILL。Windows 尝试 Ctrl+Break，超时后使用同一已验证进程句柄强制终止。存活的旧数字 PID 需人工核实。
 - 状态文件中的路径: 始终使用正斜杠
 - 原子写入: 两个平台都基于 rename，配合平台特定 fsync
 - Bundle 导入: v1 拒绝跨平台导入
@@ -94,7 +102,7 @@ src/
 ## 关键流程
 
 1. **插件接入**: `node add` → `tx run` → `tx inspect` → `tx promote`
-2. **锁冲突解决**: promote 失败 → 使用 pins 执行 `resolve` → 再次 promote
+2. **锁冲突解决** — 暂存锁定失败 → 用 pin 执行 `resolve` → 重新观察 → 晋升
 3. **插件移除与撤销**: `node remove` → 通过备份恢复执行 `undo`
 4. **引导初始化**: `init` → `install torch` → `install` → `update run` → `update promote`
 5. **环境迁移**: `env export` → `env import`（v1 仅支持同平台）

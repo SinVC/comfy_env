@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -62,6 +62,10 @@ pub fn sha256_if_exists(path: &Path) -> Result<Option<String>> {
     sha256(path).map(Some)
 }
 
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 pub fn create_workdir(base: &Path) -> Result<tempfile::TempDir> {
     fs::create_dir_all(base).with_context(|| format!("failed to create {}", base.display()))?;
     tempfile::Builder::new()
@@ -82,7 +86,7 @@ pub fn copy_file(src: &Path, dst: &Path) -> Result<()> {
 
 pub fn backup_with_marker(src: &Path, backup: &Path, marker: &Path) -> Result<()> {
     if src.try_exists()? {
-        copy_file(src, backup)?;
+        atomic_write(backup, &fs::read(src)?)?;
         atomic_write(marker, b"1")?;
     } else {
         atomic_write(marker, b"0")?;
@@ -108,13 +112,16 @@ pub fn restore_with_marker(backup: &Path, dst: &Path, marker: &Path) -> Result<(
 }
 
 pub fn remove_file_if_exists(path: &Path) -> Result<()> {
-    if !path.try_exists()? {
+    let Some(metadata) = metadata_if_exists(path)? else {
         return Ok(());
+    };
+    if is_link(&metadata) {
+        return remove_link(path, &metadata);
     }
 
     #[cfg(windows)]
     {
-        let mut permissions = fs::metadata(path)?.permissions();
+        let mut permissions = metadata.permissions();
         if permissions.readonly() {
             permissions.set_readonly(false);
             fs::set_permissions(path, permissions)?;
@@ -124,7 +131,25 @@ pub fn remove_file_if_exists(path: &Path) -> Result<()> {
 }
 
 pub fn copy_tree(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
-    let kind = fs::symlink_metadata(src)?.file_type();
+    copy_tree_with_links(src, dst, exclude, false)
+}
+
+pub fn copy_tree_preserving_links(src: &Path, dst: &Path) -> Result<()> {
+    copy_tree_with_links(src, dst, &[], true)
+}
+
+fn copy_tree_with_links(src: &Path, dst: &Path, exclude: &[&str], preserve: bool) -> Result<()> {
+    let metadata = fs::symlink_metadata(src)?;
+    if is_link(&metadata) {
+        anyhow::ensure!(
+            preserve,
+            "linked bundle entry is not supported: {}",
+            src.display()
+        );
+        fs::create_dir_all(dst.parent().context("linked entry has no parent")?)?;
+        return copy_link(src, dst, &metadata);
+    }
+    let kind = metadata.file_type();
     ensure_regular_tree_entry(src, &kind)?;
     if kind.is_file() {
         return copy_file(src, dst);
@@ -133,41 +158,12 @@ pub fn copy_tree(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let name = entry.file_name();
-        if exclude
+        if !exclude
             .iter()
             .any(|skip| name == std::ffi::OsStr::new(skip))
         {
-            continue;
+            copy_tree_with_links(&entry.path(), &dst.join(name), exclude, preserve)?;
         }
-        copy_tree(&entry.path(), &dst.join(name), exclude)?;
-    }
-    Ok(())
-}
-
-pub fn copy_tree_preserving_links(src: &Path, dst: &Path) -> Result<()> {
-    let kind = fs::symlink_metadata(src)?.file_type();
-    if kind.is_symlink() {
-        let link_target = fs::read_link(src)?;
-        let parent = dst.parent().context("linked entry has no parent")?;
-        fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&link_target, dst)?;
-        #[cfg(windows)]
-        if fs::metadata(src)?.is_dir() {
-            std::os::windows::fs::symlink_dir(&link_target, dst)?;
-        } else {
-            std::os::windows::fs::symlink_file(&link_target, dst)?;
-        }
-        return Ok(());
-    }
-    ensure_regular_tree_entry(src, &kind)?;
-    if kind.is_file() {
-        return copy_file(src, dst);
-    }
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        copy_tree_preserving_links(&entry.path(), &dst.join(entry.file_name()))?;
     }
     Ok(())
 }
@@ -182,15 +178,13 @@ fn ensure_regular_tree_entry(path: &Path, kind: &fs::FileType) -> Result<()> {
 }
 
 pub fn remove_tree(path: &Path) -> Result<()> {
-    let kind = fs::symlink_metadata(path)?.file_type();
-    if kind.is_symlink() {
-        if fs::metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
-            return fs::remove_dir(path)
-                .with_context(|| format!("failed to remove link {}", path.display()));
-        }
-        return fs::remove_file(path)
-            .with_context(|| format!("failed to remove link {}", path.display()));
+    let Some(metadata) = metadata_if_exists(path)? else {
+        return Ok(());
+    };
+    if is_link(&metadata) {
+        return remove_link(path, &metadata);
     }
+    let kind = metadata.file_type();
     ensure_regular_tree_entry(path, &kind)?;
     if kind.is_file() {
         return remove_file_if_exists(path);
@@ -199,6 +193,91 @@ pub fn remove_tree(path: &Path) -> Result<()> {
         remove_tree(&entry?.path())?;
     }
     fs::remove_dir(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
+pub fn metadata_if_exists(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+pub fn resolved_path(path: &Path) -> Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut resolved) => {
+                for component in missing.into_iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::ensure!(
+                    metadata_if_exists(ancestor)?.is_none(),
+                    "dangling path: {}",
+                    ancestor.display()
+                );
+                missing.push(
+                    ancestor
+                        .file_name()
+                        .context("path has no existing ancestor")?,
+                );
+                ancestor = ancestor.parent().context("path has no existing ancestor")?;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to resolve {}", ancestor.display()));
+            }
+        }
+    }
+}
+
+pub fn is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(unix)]
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(unix)]
+fn copy_link(src: &Path, dst: &Path, _: &fs::Metadata) -> Result<()> {
+    std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+mod windows_links;
+#[cfg(windows)]
+use windows_links::copy_link;
+
+fn remove_link(path: &Path, _metadata: &fs::Metadata) -> Result<()> {
+    #[cfg(windows)]
+    if windows_links::is_directory(_metadata) {
+        return fs::remove_dir(path)
+            .with_context(|| format!("failed to remove link {}", path.display()));
+    }
+    fs::remove_file(path).with_context(|| format!("failed to remove link {}", path.display()))
+}
+
+pub fn move_entry(from: &Path, to: &Path) -> Result<()> {
+    anyhow::ensure!(
+        metadata_if_exists(to)?.is_none(),
+        "move destination already exists: {}",
+        to.display()
+    );
+    fs::rename(from, to)
+        .with_context(|| format!("failed to move {} to {}", from.display(), to.display()))?;
+    for parent in [from.parent(), to.parent()].into_iter().flatten() {
+        sync_parent_dir(parent);
+    }
+    Ok(())
 }
 
 fn sync_parent_dir(parent: &Path) {

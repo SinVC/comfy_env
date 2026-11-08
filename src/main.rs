@@ -15,6 +15,9 @@ use clap::{Parser, error::ErrorKind};
 use crate::cli::Cli;
 
 fn main() {
+    if let Some(code) = runtime_executor::launcher_entry(std::env::args_os()) {
+        std::process::exit(code);
+    }
     std::process::exit(run(std::env::args_os()));
 }
 

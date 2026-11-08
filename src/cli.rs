@@ -91,7 +91,7 @@ pub struct PinArgs {
 #[derive(Debug, Subcommand)]
 pub enum PinSubcommand {
     Add(PinMutateArgs),
-    List,
+    List(PinListArgs),
     Remove(PinMutateArgs),
 }
 
@@ -99,6 +99,16 @@ pub enum PinSubcommand {
 pub struct PinMutateArgs {
     #[arg(required = true)]
     pub specs: Vec<String>,
+    /// Manage unscoped exact uv requirement overrides
+    #[arg(long)]
+    pub override_requirements: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PinListArgs {
+    /// Label constraints, forced overrides and inconsistent historical entries
+    #[arg(long)]
+    pub details: bool,
 }
 
 #[derive(Debug, Args)]
@@ -139,7 +149,7 @@ pub struct TxArgs {
 pub enum TxSubcommand {
     Run(TxRunArgs),
     Inspect(TxInspectArgs),
-    Abort(TxInspectArgs),
+    Abort(TxAbortArgs),
     Promote(TxPromoteArgs),
 }
 
@@ -153,6 +163,14 @@ pub struct TxRunArgs {
 #[derive(Debug, Args)]
 pub struct TxInspectArgs {
     pub tx_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct TxAbortArgs {
+    pub tx_id: String,
+    /// Confirm the owner and candidate of an old running transaction have exited
+    #[arg(long)]
+    pub confirm_stopped: bool,
 }
 
 #[derive(Debug, Args)]
@@ -178,7 +196,7 @@ pub struct UpdateArgs {
 pub enum UpdateSubcommand {
     Run(UpdateRunArgs),
     Inspect(UpdateInspectArgs),
-    Abort(UpdateInspectArgs),
+    Abort(TxAbortArgs),
     Promote(UpdatePromoteArgs),
     Resolve(UpdateResolveArgs),
 }
@@ -216,6 +234,9 @@ pub struct UpdateResolveArgs {
     pub pins: Vec<String>,
     #[arg(long)]
     pub pins_file: Option<PathBuf>,
+    /// Force uv to override conflicting requirements (the old default)
+    #[arg(long)]
+    pub override_requirements: bool,
 }
 
 #[derive(Debug, Args)]
@@ -225,6 +246,9 @@ pub struct ResolveArgs {
     pub pins: Vec<String>,
     #[arg(long)]
     pub pins_file: Option<PathBuf>,
+    /// Force uv to override conflicting requirements
+    #[arg(long)]
+    pub override_requirements: bool,
 }
 
 #[derive(Debug, Args)]
@@ -263,6 +287,8 @@ pub struct OpArgs {
 pub enum OpSubcommand {
     List,
     Inspect(OpInspectArgs),
+    /// Restore an interrupted production operation or finish its ledger link
+    Recover(OpInspectArgs),
 }
 
 #[derive(Debug, Args)]

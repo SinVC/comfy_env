@@ -1,13 +1,11 @@
-use anyhow::{Context, Result, bail};
+use anyhow::Context;
 
-use crate::cli::PinMutateArgs;
+use crate::cli::{PinListArgs, PinMutateArgs};
 use crate::dependency_sync;
-use crate::domain::{AppError, AppResult, ProjectRoot};
-use crate::safety_guards;
-use crate::state_ledger::OpKind;
-use crate::toml_support::{self, GroupEditMode};
+use crate::domain::{AppError, AppResult, ProjectRoot, TORCH_FAMILY};
+use crate::state_ledger::{OpKind, TransactionRecord};
+use crate::toml_support::{self, unscoped_exact_pin};
 
-const TORCH_FAMILY: [&str; 3] = ["torch", "torchvision", "torchaudio"];
 const RECOMMENDED_PINS: [&str; 2] = ["numpy", "transformers"];
 
 pub fn cmd_pin_add(args: PinMutateArgs, root: &ProjectRoot) -> AppResult<()> {
@@ -21,28 +19,70 @@ pub fn cmd_pin_add(args: PinMutateArgs, root: &ProjectRoot) -> AppResult<()> {
             eprintln!("WARNING: pinning non-recommended package: {spec}");
         }
     }
-    apply_pins(
-        root,
-        &args.specs,
-        OpKind::PinAdd,
-        GroupEditMode::UpsertExact,
-        "pin add",
-    )?;
+    apply_pins(root, &args, OpKind::PinAdd, false, "pin add")?;
     println!("Pins added.");
     Ok(())
 }
 
-pub fn cmd_pin_list(root: &ProjectRoot) -> AppResult<()> {
-    let pins = toml_support::read_dependency_group(&root.pyproject_toml(), "overrides")?;
-    if pins.is_empty() {
+pub fn cmd_pin_list(args: PinListArgs, root: &ProjectRoot) -> AppResult<()> {
+    let project = toml_support::read_project(&root.pyproject_toml())?;
+    let pins = toml_support::dependency_group(&project, "overrides")?;
+    let forced = toml_support::uv_overrides(&project)?;
+    if pins.is_empty() && forced.is_empty() {
         println!("No pins in overrides group.");
         return Ok(());
     }
 
-    for pin in pins {
-        println!("{pin}");
+    for pin in &pins {
+        let kind = match unscoped_exact_pin(pin) {
+            Some(exact)
+                if forced
+                    .iter()
+                    .any(|spec| unscoped_exact_pin(spec).as_ref() == Some(&exact)) =>
+            {
+                "forced"
+            }
+            Some((name, _))
+                if forced.iter().any(|spec| {
+                    unscoped_exact_pin(spec).is_some_and(|(other, _)| other == name)
+                }) =>
+            {
+                "inconsistent"
+            }
+            _ => "constraint",
+        };
+        print_pin(pin, args.details, kind);
+    }
+    for spec in &forced {
+        let kind = match unscoped_exact_pin(spec) {
+            Some(exact)
+                if pins
+                    .iter()
+                    .any(|pin| unscoped_exact_pin(pin).as_ref() == Some(&exact)) =>
+            {
+                continue;
+            }
+            Some((name, _))
+                if pins
+                    .iter()
+                    .any(|pin| unscoped_exact_pin(pin).is_some_and(|(other, _)| other == name)) =>
+            {
+                "inconsistent override"
+            }
+            Some(_) => "forced only",
+            None => "manual override",
+        };
+        print_pin(spec, args.details, kind);
     }
     Ok(())
+}
+
+fn print_pin(spec: &str, details: bool, kind: &str) {
+    if details {
+        println!("{spec}\t{kind}");
+    } else {
+        println!("{spec}");
+    }
 }
 
 pub fn cmd_pin_remove(args: PinMutateArgs, root: &ProjectRoot) -> AppResult<()> {
@@ -53,27 +93,30 @@ pub fn cmd_pin_remove(args: PinMutateArgs, root: &ProjectRoot) -> AppResult<()> 
         }
         reject_torch_family(&toml_support::normalize_package_name(package))?;
     }
-    apply_pins(
-        root,
-        packages,
-        OpKind::PinRemove,
-        GroupEditMode::RemoveNames,
-        "pin remove",
-    )?;
+    apply_pins(root, &args, OpKind::PinRemove, true, "pin remove")?;
     println!("Pins removed.");
     Ok(())
 }
 
 fn apply_pins(
     root: &ProjectRoot,
-    specs: &[String],
+    args: &PinMutateArgs,
     kind: OpKind,
-    mode: GroupEditMode,
+    remove: bool,
     action: &str,
 ) -> AppResult<()> {
     let (config, uv) = super::configured_uv(root)?;
     let staged = dependency_sync::create_staged_workdir(root)?;
-    toml_support::rewrite_dependency_group(&staged.pyproject_toml(), "overrides", mode, specs)?;
+    let specs = &args.specs;
+    let force = if args.override_requirements {
+        specs
+            .iter()
+            .map(|spec| toml_support::normalize_package_name(spec))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    toml_support::edit_pins(&staged.pyproject_toml(), specs, &force, remove)?;
     let lock = uv.lock(staged.path(), root)?;
     if !lock.success {
         return Err(AppError::runtime(format!(
@@ -82,32 +125,77 @@ fn apply_pins(
         )));
     }
 
-    let op_id = safety_guards::op_begin(kind, &specs.join(", "), root)?;
-    let mutation = (|| -> Result<()> {
-        dependency_sync::promote_workdir(&staged, root)?;
-        uv.sync_prod(root, &config)
-            .with_context(|| format!("prod sync failed during {action}"))?;
-        let smoke =
-            safety_guards::run_smoke_test(&root.as_path().join(&config.runtime.prod_env), &config)?;
-        if !smoke.passed {
-            bail!("smoke test failed during {action}: {}", smoke.detail);
-        }
-        safety_guards::op_finalize(&op_id, true, None, root)
-    })();
-    if let Err(error) = mutation {
-        return Err(super::rollback_failed_operation(
-            root, &op_id, &config, &uv, error,
-        ));
-    }
+    super::production::commit(
+        root,
+        kind,
+        &specs.join(", "),
+        None,
+        |_| Ok(()),
+        |write| {
+            dependency_sync::promote_workdir(&staged, root)?;
+            write
+                .sync(&config, &uv)
+                .with_context(|| format!("prod sync failed during {action}"))?;
+            write
+                .smoke(&config, false)
+                .with_context(|| format!("smoke test failed during {action}"))
+        },
+    )?;
     super::prune_history(root, &config);
     Ok(())
 }
 
-fn reject_torch_family(name: &str) -> AppResult<()> {
+pub(super) fn reject_torch_family(name: &str) -> AppResult<()> {
     if TORCH_FAMILY.contains(&name) {
         return Err(AppError::usage(
             "torch-family packages are managed by 'gov install torch'",
         ));
+    }
+    Ok(())
+}
+
+pub(super) fn read_pins_file(path: &std::path::Path) -> AppResult<Vec<String>> {
+    Ok(std::fs::read_to_string(path)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect())
+}
+
+pub(super) fn merge_resolution_pins(
+    tx: &mut TransactionRecord,
+    pins: Vec<String>,
+    force: bool,
+) -> AppResult<()> {
+    if pins.is_empty() {
+        return Err(AppError::usage("at least one resolution pin is required"));
+    }
+    for pin in &pins {
+        if !toml_support::is_exact_pin(pin) {
+            return Err(AppError::usage(format!("invalid resolution pin: {pin}")));
+        }
+        reject_torch_family(&toml_support::normalize_package_name(pin))?;
+    }
+    for pin in pins {
+        let name = toml_support::normalize_package_name(&pin);
+        tx.resolution_pins
+            .retain(|old| toml_support::normalize_package_name(old) != name);
+        tx.resolution_pins.push(pin);
+        tx.resolution_overrides.retain(|old| old != &name);
+        if force {
+            tx.resolution_overrides.push(name);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn apply_resolution_pins(
+    path: &std::path::Path,
+    tx: &TransactionRecord,
+) -> AppResult<()> {
+    if !tx.resolution_pins.is_empty() {
+        toml_support::edit_pins(path, &tx.resolution_pins, &tx.resolution_overrides, false)?;
     }
     Ok(())
 }

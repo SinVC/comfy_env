@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{EnvExportArgs, EnvImportArgs};
-use crate::dependency_sync::UvClient;
+use crate::dependency_sync::{self, UvClient};
 use crate::domain::{AppError, AppResult, OpId, ProjectRoot};
 use crate::fs_support;
 use crate::platform::{self, PythonClient, platform_machine, sys_platform};
@@ -69,6 +69,9 @@ fn env_export(args: EnvExportArgs, root: &ProjectRoot) -> Result<()> {
         args.output_dir.display()
     );
     let plugins = state_ledger::load_plugins(root)?;
+    dependency_sync::validate_relocatable_project(&toml_support::read_project(
+        &root.pyproject_toml(),
+    )?)?;
     let mut sources = Vec::new();
     let mut ids = BTreeSet::new();
     for plugin in &plugins {
@@ -114,7 +117,7 @@ fn export_into(
     ids: BTreeSet<String>,
 ) -> Result<()> {
     fs_support::copy_file(&root.pyproject_toml(), &output.join("pyproject.toml"))?;
-    fs_support::copy_file(&root.uv_lock(), &output.join("uv.lock"))?;
+    dependency_sync::copy_lock(root.as_path(), output)?;
     fs_support::copy_file(&root.plugins_registry(), &output.join("state/plugins.json"))?;
     let exported = uv.export_pylock(root.as_path())?;
     ensure!(
@@ -203,17 +206,15 @@ fn env_import(args: EnvImportArgs, root: &ProjectRoot) -> Result<()> {
         manifest.bundle_format_version == "1",
         "unsupported bundle format version"
     );
-    let python = UvClient::resolve_python_minor(&args.python)?;
-    let project = toml_support::read_project(&args.bundle_dir.join("pyproject.toml"))?;
+    verify_bundle(&args.bundle_dir, &manifest)?;
+    let project_bytes = verified_payload(&args.bundle_dir, &manifest, "pyproject.toml")?;
+    let project = std::str::from_utf8(&project_bytes)?.parse::<toml_edit::DocumentMut>()?;
+    dependency_sync::validate_relocatable_project(&project)?;
     let requires = project
         .get("project")
         .and_then(|item| item.get("requires-python"))
         .and_then(|item| item.as_str())
         .context("bundle project.requires-python missing")?;
-    ensure!(
-        python_satisfies(&python, requires)?,
-        "bundle requires-python is {requires}, but target python resolves to {python}"
-    );
     ensure!(
         manifest.requires_python.is_empty() || manifest.requires_python == requires,
         "manifest requires-python differs from project"
@@ -236,16 +237,28 @@ fn env_import(args: EnvImportArgs, root: &ProjectRoot) -> Result<()> {
         manifest.platform_machine,
         platform_machine()
     );
-    verify_environment_markers(&project)?;
-    verify_bundle(&args.bundle_dir, &manifest)?;
-    let plugins: Vec<PluginRecord> =
-        serde_json::from_slice(&fs::read(args.bundle_dir.join("state/plugins.json"))?)?;
+
+    let registry = verified_payload(&args.bundle_dir, &manifest, "state/plugins.json")?;
+    let plugins: Vec<PluginRecord> = serde_json::from_slice(&registry)?;
     let ids: BTreeSet<_> = plugins.iter().map(|plugin| plugin.id.clone()).collect();
     ensure!(
         ids.len() == plugins.len() && ids.iter().cloned().collect::<Vec<_>>() == manifest.node_ids,
         "bundle plugin list differs from manifest"
     );
+    let groups = plugins
+        .iter()
+        .map(|plugin| toml_support::normalize_package_name(&plugin.group))
+        .collect::<BTreeSet<_>>();
+    for group in toml_support::dependency_group_names(&project)? {
+        let normalized = toml_support::normalize_package_name(group);
+        ensure!(
+            !normalized.starts_with("node-") || groups.contains(&normalized),
+            "bundle dependency group {group} has no registered node owner"
+        );
+    }
     for plugin in &plugins {
+        super::node::validate_group_owner(&plugins, &plugin.group, &plugin.id)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
         let source = plugin_source(&args.comfyui_dir, plugin)?;
         ensure!(
             args.bundle_dir
@@ -260,31 +273,25 @@ fn env_import(args: EnvImportArgs, root: &ProjectRoot) -> Result<()> {
             "invalid plugin destination"
         );
     }
+    let bundle = fs::canonicalize(&args.bundle_dir)?;
     let nodes_target = args.comfyui_dir.join("custom_nodes");
-    if let Ok(metadata) = fs::symlink_metadata(&nodes_target) {
+    if let Some(metadata) = fs_support::metadata_if_exists(&nodes_target)? {
         ensure!(
-            !metadata.file_type().is_symlink(),
-            "target custom_nodes cannot be a link"
+            metadata.is_dir() && !fs_support::is_link(&metadata),
+            "target custom_nodes must be an ordinary directory"
         );
     }
-    let bundle = fs::canonicalize(&args.bundle_dir)?;
-    let nodes_guard = if nodes_target.exists() {
-        fs::canonicalize(&nodes_target)?
-    } else {
-        nodes_target.clone()
-    };
+    let nodes_target = fs_support::resolved_path(&nodes_target)?;
+    let project_root = fs::canonicalize(root.as_path())?;
+    let state_dir = fs_support::resolved_path(&root.state_dir())?;
     ensure!(
-        !bundle.starts_with(&nodes_guard),
-        "bundle cannot reside in target custom_nodes"
+        !overlaps(&bundle, &nodes_target)
+            && !project_root.starts_with(&bundle)
+            && !project_root.starts_with(&nodes_target)
+            && !overlaps(&nodes_target, &state_dir)
+            && !overlaps(&bundle, &state_dir),
+        "bundle, target custom_nodes and governance paths overlap"
     );
-    let uv = UvClient::new(&python);
-    let check = uv.lock_check(&args.bundle_dir)?;
-    ensure!(
-        check.success,
-        "bundle lock check failed: {}",
-        check.summary_line()
-    );
-
     let old_config = toml_support::read_config(&root.config_toml())?;
     let old_lock = root.uv_lock().exists();
     ensure!(
@@ -322,118 +329,82 @@ fn env_import(args: EnvImportArgs, root: &ProjectRoot) -> Result<()> {
         old_lock || !old_env_path.exists(),
         "existing production environment has no previous lock to restore"
     );
-    let op = safety_guards::op_begin(OpKind::EnvImport, &platform::to_state_path(&bundle), root)?;
-    let result = (|| -> Result<RuntimeConfig> {
-        safety_guards::backup_import_config(&op, root)?;
-        safety_guards::backup_import_nodes(&op, &args.comfyui_dir.join("custom_nodes"), root)?;
-        for (from, to) in [
-            (
-                args.bundle_dir.join("pyproject.toml"),
-                root.pyproject_toml(),
-            ),
-            (args.bundle_dir.join("uv.lock"), root.uv_lock()),
-            (
-                args.bundle_dir.join("state/plugins.json"),
-                root.plugins_registry(),
-            ),
-        ] {
-            fs_support::atomic_write(&to, &fs::read(from)?)?;
-        }
-        toml_support::set_import_config(&root.config_toml(), &args.comfyui_dir, &python)?;
-        let config =
-            toml_support::read_config(&root.config_toml())?.context("imported config missing")?;
-        uv.sync_prod(root, &config)
-            .context("production sync failed")?;
-        sync_custom_nodes(&args.bundle_dir, &args.comfyui_dir, &plugins)?;
-        let smoke =
-            safety_guards::run_smoke_test(&root.as_path().join(&config.runtime.prod_env), &config)?;
-        ensure!(smoke.passed, "smoke test failed: {}", smoke.detail);
-        safety_guards::op_finalize(&op, true, None, root)?;
-        Ok(config)
-    })();
-    let config = match result {
-        Ok(config) => config,
-        Err(error) => bail!(
-            "{}",
-            rollback_import(
+    let resolved_env = fs_support::resolved_path(&old_env_path)?;
+    ensure!(
+        !overlaps(&resolved_env, &nodes_target)
+            && !overlaps(&resolved_env, &bundle)
+            && !overlaps(&resolved_env, &state_dir)
+            && !project_root.starts_with(&resolved_env)
+            && resolved_env.starts_with(&project_root),
+        "production environment overlaps a protected import path"
+    );
+
+    let found = UvClient::find_python(&args.python)?;
+    ensure!(
+        found.success,
+        "target Python lookup failed: {}",
+        found.summary_line()
+    );
+    let interpreter = Path::new(&found.stdout);
+    let python_version = PythonClient::version_full(interpreter)?;
+    let uv = UvClient::new(&found.stdout);
+    let check = uv.lock_check(&args.bundle_dir)?;
+    ensure!(
+        check.success,
+        "bundle lock check failed: {}",
+        check.summary_line()
+    );
+    let probe = tempfile::tempdir()?;
+    let check = uv.check_target(&args.bundle_dir, &probe.path().join("env"))?;
+    ensure!(
+        check.success,
+        "target Python {python_version} is incompatible with the bundle requirements or environment markers: {}",
+        check.summary_line()
+    );
+
+    let nodes = safety_guards::node_swap::NodePlan::inspect(
+        &nodes_target,
+        plugins.iter().map(|plugin| plugin.id.clone().into()),
+    )?;
+    let lock = String::from_utf8(verified_payload(&args.bundle_dir, &manifest, "uv.lock")?)?;
+    let lock = dependency_sync::relocate_lock_contents(&args.bundle_dir, root.as_path(), lock)?;
+    let config = super::production::commit(
+        root,
+        OpKind::EnvImport,
+        &platform::to_state_path(&bundle),
+        None,
+        |op| {
+            safety_guards::backup_config(op, root)?;
+            nodes.prepare(
+                &bundle.join("custom_nodes"),
                 root,
-                &op,
-                old_config.as_ref(),
-                old_lock,
-                &old_env_path,
-                error
+                &OpId(op.op_id.clone()),
+                |name, staged| verify_staged_node(&manifest, name, staged),
             )
-        ),
-    };
+        },
+        |write| {
+            fs_support::atomic_write(&root.pyproject_toml(), &project_bytes)?;
+            fs_support::atomic_write(&root.plugins_registry(), &registry)?;
+            fs_support::atomic_write(&root.uv_lock(), lock.as_bytes())?;
+            toml_support::set_import_config(&root.config_toml(), &args.comfyui_dir, &found.stdout)?;
+            let config = toml_support::read_config(&root.config_toml())?
+                .context("imported config missing")?;
+            write.sync(&config, &uv)?;
+            write.touch_source()?;
+            nodes.publish(root, &write.op_id())?;
+            write.smoke(&config, false)?;
+            Ok(config)
+        },
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
     super::prune_history(root, &config);
     println!("Environment imported: {}", bundle.display());
     Ok(())
 }
 
-fn rollback_import(
-    root: &ProjectRoot,
-    op: &OpId,
-    old_config: Option<&RuntimeConfig>,
-    old_lock: bool,
-    old_env: &Path,
-    error: anyhow::Error,
-) -> AppError {
-    let mut message = format!("env import failed: {error:#}");
-    if let Err(restore) = safety_guards::op_restore(op, root) {
-        message.push_str(&format!("; restore failed: {restore:#}"));
-    }
-    if old_lock {
-        if let Some(config) = old_config {
-            let uv = UvClient::new(config.runtime.python.as_deref().unwrap_or_default());
-            if let Err(sync) = uv.sync_prod(root, config) {
-                message.push_str(&format!("; recovery sync failed: {sync:#}"));
-            }
-        } else {
-            message.push_str("; recovery sync unavailable: previous config missing");
-        }
-    } else if old_env.exists() {
-        if let Err(remove) = fs_support::remove_tree(old_env) {
-            message.push_str(&format!("; failed to remove new environment: {remove:#}"));
-        }
-    }
-    if let Err(record) = safety_guards::op_finalize(op, false, Some(message.clone()), root) {
-        message.push_str(&format!("; failed to record operation: {record:#}"));
-    }
-    AppError::runtime(message)
+fn overlaps(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
 }
-
-fn sync_custom_nodes(bundle: &Path, comfy: &Path, plugins: &[PluginRecord]) -> Result<()> {
-    let target = comfy.join("custom_nodes");
-    fs::create_dir_all(&target)?;
-    for entry in fs::read_dir(&target)? {
-        let entry = entry?;
-        if entry.file_type()?.is_symlink() {
-            eprintln!(
-                "warning: preserving linked custom_nodes entry: {}",
-                entry.path().display()
-            );
-            continue;
-        }
-        fs_support::remove_tree(&entry.path())?;
-    }
-    for plugin in plugins {
-        let destination = target.join(&plugin.id);
-        if destination.symlink_metadata().is_ok() {
-            eprintln!(
-                "warning: preserving linked custom_nodes entry: {}",
-                destination.display()
-            );
-            continue;
-        }
-        fs_support::copy_tree(
-            &bundle.join("custom_nodes").join(&plugin.id),
-            &destination,
-            &[],
-        )?;
-    }
-    Ok(())
-}
-
 fn verify_bundle(bundle: &Path, manifest: &BundleManifest) -> Result<()> {
     for required in REQUIRED_FILES {
         ensure!(
@@ -443,9 +414,44 @@ fn verify_bundle(bundle: &Path, manifest: &BundleManifest) -> Result<()> {
     }
     let mut actual = BTreeMap::new();
     collect_hashes(bundle, bundle, &mut actual)?;
+    actual.remove("manifest.json");
     ensure!(
         actual == manifest.files.sha256,
         "bundle manifest checksum mismatch or payload file list changed"
+    );
+    Ok(())
+}
+
+fn verified_payload(bundle: &Path, manifest: &BundleManifest, name: &str) -> Result<Vec<u8>> {
+    let bytes = fs::read(bundle.join(name))?;
+    ensure!(
+        manifest.files.sha256.get(name) == Some(&fs_support::sha256_bytes(&bytes)),
+        "bundle checksum mismatch for {name}"
+    );
+    Ok(bytes)
+}
+
+fn verify_staged_node(
+    manifest: &BundleManifest,
+    name: &std::ffi::OsStr,
+    staged: &Path,
+) -> Result<()> {
+    let prefix = format!("custom_nodes/{}/", name.to_string_lossy());
+    let expected = manifest
+        .files
+        .sha256
+        .iter()
+        .filter_map(|(path, hash)| {
+            path.strip_prefix(&prefix)
+                .map(|path| (path.to_owned(), hash.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut actual = BTreeMap::new();
+    collect_hashes(staged, staged, &mut actual)?;
+    ensure!(
+        actual == expected,
+        "staged node checksum mismatch for {}",
+        name.to_string_lossy()
     );
     Ok(())
 }
@@ -454,15 +460,21 @@ fn collect_hashes(base: &Path, dir: &Path, hashes: &mut BTreeMap<String, String>
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        let kind = entry.file_type()?;
         ensure!(
-            !kind.is_symlink(),
+            entry.file_name() != ".git",
+            "bundle contains Git metadata: {}",
+            path.display()
+        );
+        let metadata = fs::symlink_metadata(&path)?;
+        let kind = metadata.file_type();
+        ensure!(
+            !fs_support::is_link(&metadata),
             "linked bundle entry is not supported: {}",
             path.display()
         );
         if kind.is_dir() {
             collect_hashes(base, &path, hashes)?;
-        } else if kind.is_file() && path != base.join("manifest.json") {
+        } else if kind.is_file() {
             let relative = path.strip_prefix(base)?;
             hashes.insert(
                 platform::to_state_path(relative),
@@ -514,84 +526,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
         .unwrap_or(Path::new("."));
     let name = path.file_name().context("path must name a directory")?;
     Ok(fs::canonicalize(parent)?.join(name))
-}
-
-fn python_satisfies(python: &str, requires: &str) -> Result<bool> {
-    let mut parts = python.split('.');
-    let major: u32 = parts.next().context("invalid Python minor")?.parse()?;
-    let minor: u32 = parts.next().context("invalid Python minor")?.parse()?;
-    let version = (major, minor);
-    for clause in requires.split(',') {
-        let clause = clause.trim();
-        let (op, raw) = ["==", ">=", "<=", "~=", ">", "<"]
-            .into_iter()
-            .find_map(|op| clause.strip_prefix(op).map(|raw| (op, raw.trim())))
-            .context("unsupported requires-python constraint")?;
-        let numeric = raw.trim_end_matches(".*");
-        let values: Vec<u32> = numeric
-            .split('.')
-            .map(str::parse)
-            .collect::<std::result::Result<_, _>>()?;
-        ensure!(
-            values.len() >= 2,
-            "unsupported requires-python constraint: {clause}"
-        );
-        let bound = (values[0], values[1]);
-        let matches = match op {
-            "==" => version == bound,
-            ">=" => version >= bound,
-            ">" => version > bound,
-            "<=" => version <= bound,
-            "<" => version < bound,
-            "~=" => version >= bound && version.0 == bound.0,
-            _ => false,
-        };
-        if !matches {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn verify_environment_markers(project: &toml_edit::DocumentMut) -> Result<()> {
-    let markers = project
-        .get("tool")
-        .and_then(|item| item.get("uv"))
-        .and_then(|item| item.get("environments"));
-    let Some(markers) = markers else {
-        return Ok(());
-    };
-    let values = markers
-        .as_array()
-        .context("tool.uv.environments must be an array")?;
-    if values.is_empty() {
-        return Ok(());
-    }
-    ensure!(
-        values
-            .iter()
-            .any(|item| item.as_str().is_some_and(marker_matches_host)),
-        "bundle platform incompatible: expected sys_platform={} and platform_machine={}",
-        sys_platform(),
-        platform_machine()
-    );
-    Ok(())
-}
-
-fn marker_matches_host(marker: &str) -> bool {
-    marker.split(" or ").any(|alternative| {
-        alternative.split(" and ").all(|condition| {
-            let Some((name, value)) = condition.trim().split_once("==") else {
-                return false;
-            };
-            let value = value.trim().trim_matches(['\'', '"']);
-            match name.trim() {
-                "sys_platform" => value == sys_platform(),
-                "platform_machine" => value == platform_machine(),
-                _ => false,
-            }
-        })
-    })
 }
 
 fn platform_system() -> &'static str {
