@@ -27,12 +27,23 @@ def write(path, value):
     path.write_text(value, encoding="utf-8")
 
 
-def wheel(directory, version):
-    distribution = f"slice3_probe-{version}"
+def write_main(path, body):
+    write(path, (
+        'import sys\nfrom pathlib import Path\nfrom types import SimpleNamespace\n'
+        'args = SimpleNamespace(quick_test_for_ci="--quick-test-for-ci" in sys.argv)\n'
+        + body + '\nprint("Import times for custom nodes:")\n'
+        'print("0.0 seconds: " + str(Path.cwd() / "custom_nodes" / "fixture"))\n'
+        'if args.quick_test_for_ci:\n    exit(0)\n'
+    ))
+
+
+def wheel(directory, version, name="slice3-probe"):
+    module = name.replace("-", "_")
+    distribution = f"{module}-{version}"
     with zipfile.ZipFile(directory / f"{distribution}-py3-none-any.whl", "w") as archive:
-        archive.writestr("slice3_probe.py", f'VERSION = "{version}"\n')
+        archive.writestr(f"{module}.py", f'VERSION = "{version}"\n')
         metadata = distribution + ".dist-info/"
-        archive.writestr(metadata + "METADATA", f"Metadata-Version: 2.1\nName: slice3-probe\nVersion: {version}\n")
+        archive.writestr(metadata + "METADATA", f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
         archive.writestr(metadata + "WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
         files = [*archive.namelist(), metadata + "RECORD"]
         archive.writestr(metadata + "RECORD", "".join(f"{name},,\n" for name in files))
@@ -87,7 +98,7 @@ def verify(binary, root):
     nodes = ui / "custom_nodes"
     nodes.mkdir(parents=True)
     main = ui / "main.py"
-    write(main, "import slice3_probe\nprint(slice3_probe.VERSION, flush=True)\n")
+    write_main(main, "import slice3_probe\nprint(slice3_probe.VERSION, flush=True)\n")
     wheels = root / "wheels"
     wheels.mkdir()
     wheel(wheels, "1.0")
@@ -244,20 +255,22 @@ def verify(binary, root):
     command(project, str(prod), "-c", "import slice3_probe")
     print("PASS remove smoke rollback, purge, and undo restored truth, registry, code and packages", flush=True)
 
-    write(main, "import time\nprint('waiting', flush=True)\ntime.sleep(30)\n")
-    timeout = run("fixture", "completed", "--timeout", "1")
+    write_main(main, "import time\nprint('waiting', flush=True)\ntime.sleep(30)\n")
+    timeout = run("fixture", "failed", "--timeout", "1")
+    assert timeout["observation"]["outcome"] == "timed_out", timeout
     gov("tx", "abort", timeout["txid"])
     expect_status(timeout, "aborted")
     assert not any(path.exists() for path in artifacts(timeout)), timeout
-    write(main, "raise SystemExit(7)\n")
+    write_main(main, "raise SystemExit(7)\n")
     failed = run("fixture", "failed")
+    assert failed["observation"]["outcome"] == "nonzero_exit", failed
     gov("tx", "promote", failed["txid"], expected=None)
     gov("tx", "promote", failed["txid"], "--allow-failed-run", "--keep-artifacts")
     expect_status(failed, "promoted")
     assert all(path.exists() for path in artifacts(failed)), failed
     print("PASS observation timeout, abort cleanup, failed observation and retained artifacts", flush=True)
 
-    write(main, "import slice3_probe\n")
+    write_main(main, "import slice3_probe\n")
     marker = fail_one_sync(root, "candidate")
     try:
         sync_failure = run("fixture", "failed")
@@ -271,7 +284,7 @@ def verify(binary, root):
 
     requirements = nodes / "fixture" / "requirements.txt"
     write(requirements, "slice3-probe==2.0\n")
-    write(main, "import slice3_probe\nassert slice3_probe.VERSION == '2.0'\n")
+    write_main(main, "import slice3_probe\nassert slice3_probe.VERSION == '2.0'\n")
     conflict = run("fixture", "needs_resolution")
     txid = conflict["txid"]
     assert (state / "conflicts" / f"{txid}.json").exists(), conflict

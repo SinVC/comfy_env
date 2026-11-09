@@ -14,12 +14,13 @@ Prepare the configuration from existing values or `config.toml.template`.
 Prepare the project from existing truth or `pyproject.toml.template`. Set
 `requires-python` to the resolved minor series and `tool.uv.environments` to
 the host platform and architecture. Lock the staged project before writing
-production. Then create the standard state and cache directories, initialize
+production. Then create the standard state directories, initialize
 the registry if missing, and sync production against the locked truth.
 
 On first init, a failure before the lock succeeds leaves the root truth files
-unwritten. If sync fails after writing the configuration and locked truth,
-retry init to finish the bootstrap.
+unwritten. Configuration and truth publication and the first sync use the
+operation recovery ledger. If sync fails, restore the previous files and remove
+the newly created venv so the first init can be retried.
 
 For an initialized project with configuration and locked truth, reinit checks
 production is stopped and uses the shared production commit. It backs up the

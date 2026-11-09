@@ -48,8 +48,8 @@ Rules:
 8. Bundle source snapshots exclude VCS admin metadata (`.git/`).
 9. The Rust binary is the sole entry point. No shell wrappers or dispatchers in the product.
 10. Linux and Windows share the same command and recovery contracts.
-11. Production writes are serialized. A managed ComfyUI process and unresolved production recovery each gate writes. The PID lock coordinates runtime launch, stop and cleanup.
-12. Promotion applies the observed lock after validating production truth, staged truth and the actual production package set. The current core policy controls approval.
+11. The production lock serializes writers, recovery and runtime startup. A managed ComfyUI process group or job and unresolved recovery each gate writes after the lock is acquired.
+12. Promotion validates production truth, staged truth, the actual production package set and the resolved interpreter. It applies the observed lock and verifies the resulting interpreter and package set before commit. The current core policy controls approval.
 13. An operation commits in its ledger before linking a promotion or undo. Recover an interrupted write or missing link through `gov op recover`.
 
 ## Module Map

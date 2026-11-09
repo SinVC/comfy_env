@@ -95,6 +95,8 @@ pub struct TransactionRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Observation {
     pub outcome: ObservationOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<crate::platform::PythonIdentity>,
     pub candidate_before: Vec<String>,
     pub package_drift: PackageDiff,
     pub node_failures: Vec<String>,
@@ -180,6 +182,9 @@ pub enum OpKind {
     EnvImport,
     ManualUndo,
     Reinit,
+    Init,
+    RuntimeSync,
+    NodeAdd,
     #[serde(untagged)]
     Historical(String),
 }
@@ -197,6 +202,9 @@ impl std::fmt::Display for OpKind {
             Self::EnvImport => "env_import",
             Self::ManualUndo => "manual_undo",
             Self::Reinit => "reinit",
+            Self::Init => "init",
+            Self::RuntimeSync => "runtime_sync",
+            Self::NodeAdd => "node_add",
             Self::Historical(kind) => kind,
         };
         f.write_str(value)
@@ -262,6 +270,8 @@ pub struct OperationRecovery {
 pub struct EnvironmentRecovery {
     pub path: String,
     pub existed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_python: Option<crate::platform::PythonIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

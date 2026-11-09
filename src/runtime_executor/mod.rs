@@ -29,21 +29,18 @@ pub fn run_prod(
     comfyui_dir: &Path,
     args: &[OsString],
     pid_path: &Path,
-    before_launch: impl FnOnce() -> Result<()>,
+    guard: File,
 ) -> Result<i32> {
-    let guard = lock_pid_file(pid_path)?;
-    ensure_prod_stopped(pid_path)?;
     fs_support::remove_file_if_exists(pid_path)?;
-    before_launch()?;
 
     let python = platform::venv_python(env);
-    #[cfg(unix)]
+    #[cfg(not(any(target_os = "linux", windows)))]
     let mut command = Command::new(&python);
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     let gate_dir = tempfile::tempdir_in(pid_path.parent().context("PID file has no parent")?)?;
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     let gate = gate_dir.path().join("ready");
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     let mut command = {
         let owner = ProcessIdentity::capture(std::process::id())?;
         let mut launcher = Command::new(std::env::current_exe()?);
@@ -59,21 +56,24 @@ pub fn run_prod(
         .args(args)
         .current_dir(comfyui_dir);
     let interrupts = platform::RunInterrupts::install()?;
-    #[cfg(unix)]
+    #[cfg(not(any(target_os = "linux", windows)))]
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {}", python.display()))?;
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     let mut process = platform::CandidateProcess::spawn(&mut command)
         .with_context(|| format!("failed to start {}", python.display()))?;
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     let child = &mut process.child;
     let pid = child.id();
     interrupts.set_child(pid);
-    let record = (|| -> Result<ProcessIdentity> {
-        let identity = ProcessIdentity::capture(pid)?;
+    let record = (|| -> Result<RuntimeIdentity> {
+        let identity = RuntimeIdentity {
+            process: ProcessIdentity::capture(pid)?,
+            supervised: cfg!(target_os = "linux"),
+        };
         fs_support::atomic_write(pid_path, &serde_json::to_vec(&identity)?)?;
-        #[cfg(windows)]
+        #[cfg(any(target_os = "linux", windows))]
         if let Err(error) = fs_support::atomic_write(&gate, &[1]) {
             fs_support::remove_file_if_exists(pid_path)?;
             return Err(error);
@@ -92,6 +92,21 @@ pub fn run_prod(
     };
     drop(guard);
 
+    #[cfg(target_os = "linux")]
+    let status = {
+        let mut forwarded = false;
+        loop {
+            if let Some(status) = child.try_wait().context("failed to wait for ComfyUI")? {
+                break status;
+            }
+            if interrupts.interrupted() && !forwarded {
+                platform::interrupt_supervisor(&identity.process)?;
+                forwarded = true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
     let status = child.wait().context("failed to wait for ComfyUI")?;
     #[cfg(windows)]
     process
@@ -99,17 +114,15 @@ pub fn run_prod(
         .context("failed to close the ComfyUI process tree")?;
     drop(interrupts);
     let _guard = lock_pid_file(pid_path)?;
-    if matches!(read_record(pid_path)?, Some(PidRecord::Verified(record)) if record == identity) {
+    if matches!(read_record(pid_path)?, Some(PidRecord::Verified(record)) if record == identity && !record.is_alive()?)
+    {
         fs_support::remove_file_if_exists(pid_path)?;
     }
     Ok(platform::exit_code(status))
 }
 
 pub fn stop(pid_path: &Path, grace_seconds: u32) -> Result<StopOutcome> {
-    if !pid_path.try_exists()? {
-        return Ok(StopOutcome::NotRunning);
-    }
-    let _guard = lock_pid_file(pid_path)?;
+    let _guard = try_lock_production(pid_path)?;
     let Some(record) = read_record(pid_path)? else {
         return Ok(StopOutcome::NotRunning);
     };
@@ -119,8 +132,9 @@ pub fn stop(pid_path: &Path, grace_seconds: u32) -> Result<StopOutcome> {
                 "legacy PID is still alive but its identity is unverified; verify and stop it manually"
             );
         };
-        platform::terminate_process(&identity, grace_seconds)
-            .with_context(|| format!("failed to stop ComfyUI (PID {})", identity.pid))?;
+        identity
+            .stop(grace_seconds)
+            .with_context(|| format!("failed to stop ComfyUI (PID {})", identity.process.pid))?;
         StopOutcome::Terminated
     } else {
         StopOutcome::AlreadyStopped
@@ -130,26 +144,54 @@ pub fn stop(pid_path: &Path, grace_seconds: u32) -> Result<StopOutcome> {
 }
 
 enum PidRecord {
-    Verified(ProcessIdentity),
+    Verified(RuntimeIdentity),
     Legacy(u32),
 }
 
 impl PidRecord {
     fn pid(&self) -> u32 {
         match self {
-            Self::Verified(identity) => identity.pid,
+            Self::Verified(identity) => identity.process.pid,
             Self::Legacy(pid) => *pid,
         }
     }
 
     fn is_alive(&self) -> Result<bool> {
         match self {
-            #[cfg(unix)]
             Self::Verified(identity) => identity.is_alive(),
-            #[cfg(windows)]
-            Self::Verified(identity) => identity.candidate_is_alive(),
-            Self::Legacy(pid) => Ok(platform::check_process_alive(*pid)?),
+            Self::Legacy(pid) => platform::check_process_alive(*pid).with_context(|| {
+                format!("cannot verify legacy PID {pid}; check its identity and permissions")
+            }),
         }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct RuntimeIdentity {
+    #[serde(flatten)]
+    process: ProcessIdentity,
+    #[serde(default)]
+    supervised: bool,
+}
+
+impl RuntimeIdentity {
+    fn is_alive(&self) -> Result<bool> {
+        #[cfg(target_os = "linux")]
+        if self.supervised {
+            return platform::production_group_alive(&self.process);
+        }
+        #[cfg(windows)]
+        return self.process.candidate_is_alive();
+        #[cfg(unix)]
+        self.process.is_alive()
+    }
+
+    fn stop(&self, grace_seconds: u32) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.supervised {
+            return platform::stop_supervised(&self.process, grace_seconds);
+        }
+        Ok(platform::terminate_process(&self.process, grace_seconds)?)
     }
 }
 
@@ -180,47 +222,61 @@ fn read_record(path: &Path) -> Result<Option<PidRecord>> {
     {
         return Ok(Some(PidRecord::Legacy(pid)));
     }
-    let identity: ProcessIdentity = serde_json::from_str(&text).with_context(|| {
+    let identity: RuntimeIdentity = serde_json::from_str(&text).with_context(|| {
         format!(
             "invalid process record at {}; verify ComfyUI is stopped",
             path.display()
         )
     })?;
     ensure!(
-        identity.pid > 0 && !identity.creation.is_empty(),
+        identity.process.pid > 0 && !identity.process.creation.is_empty(),
         "invalid ComfyUI process identity"
     );
     Ok(Some(PidRecord::Verified(identity)))
 }
 
+pub fn try_lock_production(pid_path: &Path) -> Result<File> {
+    let file = open_pid_lock(pid_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!("another gov command is using production; retry when it finishes")
+        }
+        Err(error) => Err(error).context("failed to lock production"),
+    }
+}
+
 fn lock_pid_file(pid_path: &Path) -> Result<File> {
+    let file = open_pid_lock(pid_path)?;
+    file.lock().context("failed to lock production")?;
+    Ok(file)
+}
+
+fn open_pid_lock(pid_path: &Path) -> Result<File> {
     // Lock a separate file whose identity survives PID file replacement.
     let lock_path = pid_path.with_extension("pid.lock");
     if let Some(dir) = lock_path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&lock_path)
-        .with_context(|| format!("failed to open {}", lock_path.display()))?;
-    file.lock()
-        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
-    Ok(file)
+        .with_context(|| format!("failed to open {}", lock_path.display()))
 }
 
 const CANDIDATE_LAUNCHER: &str = "--internal-candidate-launcher";
-#[cfg(windows)]
+#[cfg(any(target_os = "linux", windows))]
 const PROD_LAUNCHER: &str = "--internal-prod-launcher";
 
 pub fn launcher_entry(mut args: impl Iterator<Item = OsString>) -> Option<i32> {
     args.next();
     let launcher = args.next()?;
-    #[cfg(windows)]
+    #[cfg(any(target_os = "linux", windows))]
     if launcher == PROD_LAUNCHER {
-        return Some(run_windows_prod_launcher(args).unwrap_or_else(|error| {
+        return Some(run_prod_launcher(args).unwrap_or_else(|error| {
             eprintln!("gov: production launcher failed: {error:#}");
             125
         }));
@@ -247,8 +303,8 @@ pub fn launcher_entry(mut args: impl Iterator<Item = OsString>) -> Option<i32> {
     }))
 }
 
-#[cfg(windows)]
-fn run_windows_prod_launcher(mut args: impl Iterator<Item = OsString>) -> Result<i32> {
+#[cfg(any(target_os = "linux", windows))]
+fn run_prod_launcher(mut args: impl Iterator<Item = OsString>) -> Result<i32> {
     let gate = std::path::PathBuf::from(args.next().context("missing production start gate")?);
     let owner = args.next().context("missing production owner identity")?;
     let owner: ProcessIdentity = serde_json::from_str(
@@ -256,7 +312,10 @@ fn run_windows_prod_launcher(mut args: impl Iterator<Item = OsString>) -> Result
             .to_str()
             .context("invalid production owner identity")?,
     )?;
+    #[cfg(windows)]
     platform::keep_launcher_alive_on_break()?;
+    #[cfg(target_os = "linux")]
+    platform::install_supervisor_signals()?;
     loop {
         match fs::read(&gate) {
             Ok(bytes) if bytes == [1] => break,
@@ -268,9 +327,12 @@ fn run_windows_prod_launcher(mut args: impl Iterator<Item = OsString>) -> Result
         std::thread::sleep(Duration::from_millis(20));
     }
     let program = args.next().context("missing production interpreter")?;
-    Ok(platform::exit_code(
-        Command::new(program).args(args).status()?,
-    ))
+    let mut command = Command::new(program);
+    command.args(args);
+    #[cfg(windows)]
+    return Ok(platform::exit_code(command.status()?));
+    #[cfg(target_os = "linux")]
+    platform::supervise_production(&mut command)
 }
 
 pub fn run_candidate(

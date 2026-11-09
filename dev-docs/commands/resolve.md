@@ -18,6 +18,8 @@ resolution pins. A normal pin adds a constraint in
 pins from this invocation to `tool.uv.override-dependencies`. The Torch family
 is managed by `gov install torch`.
 
+Apply and validate the staged edit before replacing the old record or stage.
+A rejected pin leaves the existing conflict evidence available for retry.
 Before locking the new stage, invalidate the earlier observation and record
 this invocation as owner. If the lock conflicts, keep the updated report in
 `needs_resolution` and offer the explicit force flag when appropriate. When

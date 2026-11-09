@@ -22,14 +22,22 @@ pub fn cmd_install(args: InstallArgs, root: &ProjectRoot) -> AppResult<()> {
         ));
     }
 
-    let requirements = args.requirements_file.unwrap_or_else(|| {
-        config
+    let requirements = match args.requirements_file {
+        Some(path) => path,
+        None => config
             .paths
             .comfyui_dir
-            .as_ref()
-            .map(|dir| dir.join("requirements.txt"))
-            .unwrap_or_else(|| root.as_path().join("requirements.txt"))
-    });
+            .as_deref()
+            .filter(|path| !path.as_os_str().is_empty())
+            .ok_or_else(|| AppError::usage("config.toml is missing paths.comfyui_dir"))?
+            .join("requirements.txt"),
+    };
+    if !requirements.is_file() {
+        return Err(AppError::usage(format!(
+            "requirements file missing: {}",
+            requirements.display()
+        )));
+    }
     let specs = read_core_requirements(&requirements)?;
     ensure_uv_available()?;
     let staged = dependency_sync::create_staged_workdir(root)?;
@@ -110,15 +118,7 @@ pub(crate) fn read_core_requirements(path: &Path) -> AppResult<Vec<String>> {
         .with_context(|| format!("failed to read requirements file {}", path.display()))?;
     let mut specs = Vec::new();
     for (offset, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let comment = line
-            .char_indices()
-            .find(|(i, ch)| *ch == '#' && line[..*i].ends_with(char::is_whitespace))
-            .map(|(i, _)| i);
-        let spec = line[..comment.unwrap_or(line.len())].trim();
+        let spec = requirement_text(raw);
         if spec.is_empty() {
             continue;
         }
@@ -142,6 +142,18 @@ pub(crate) fn read_core_requirements(path: &Path) -> AppResult<Vec<String>> {
         }
     }
     Ok(specs)
+}
+
+pub(super) fn requirement_text(line: &str) -> &str {
+    let line = line.trim();
+    if line.starts_with('#') {
+        return "";
+    }
+    let comment = line
+        .char_indices()
+        .find(|(i, ch)| *ch == '#' && line[..*i].ends_with(char::is_whitespace))
+        .map(|(i, _)| i);
+    line[..comment.unwrap_or(line.len())].trim_end()
 }
 
 fn ensure_uv_available() -> AppResult<()> {

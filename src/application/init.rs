@@ -10,7 +10,6 @@ use crate::{fs_support, platform, safety_guards, state_ledger, toml_support};
 
 pub fn cmd_init(args: InitArgs, root: &ProjectRoot) -> AppResult<()> {
     let config_path = root.config_toml();
-    safety_guards::ensure_production_recoverable(root)?;
     let existing =
         config_path.is_file() && root.pyproject_toml().is_file() && root.uv_lock().is_file();
     if !config_path.try_exists()? && (args.comfyui_dir.is_none() || args.python.is_none()) {
@@ -20,6 +19,22 @@ pub fn cmd_init(args: InitArgs, root: &ProjectRoot) -> AppResult<()> {
     }
 
     let (mut config_doc, config) = toml_support::config_for_init(&config_path)?;
+    if existing
+        && config
+            .runtime
+            .python
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+    {
+        return Err(AppError::usage(
+            "existing project has no configured Python for recovery",
+        ));
+    }
+    if !existing && root.as_path().join(&config.runtime.prod_env).try_exists()? {
+        return Err(AppError::usage(
+            "cannot initialize over an existing production environment without recoverable truth",
+        ));
+    }
     let comfyui_dir = args
         .comfyui_dir
         .as_deref()
@@ -53,7 +68,6 @@ pub fn cmd_init(args: InitArgs, root: &ProjectRoot) -> AppResult<()> {
         state.join("conflicts"),
         root.work_dir(),
         root.ops_dir(),
-        root.as_path().join("cache"),
         root.as_path().join(&config.runtime.candidate_root),
     ] {
         fs::create_dir_all(&path)
@@ -67,33 +81,22 @@ pub fn cmd_init(args: InitArgs, root: &ProjectRoot) -> AppResult<()> {
         }
         Ok(())
     };
-    if existing {
-        if config
-            .runtime
-            .python
-            .as_deref()
-            .is_none_or(|s| s.trim().is_empty())
-        {
-            return Err(AppError::usage(
-                "existing project has no configured Python for recovery",
-            ));
-        }
-        super::production::commit(
-            root,
-            OpKind::Reinit,
-            &python,
-            None,
-            |record| safety_guards::backup_config(record, root),
-            |write| {
-                write_truth()?;
-                write.sync(&config, &uv)
-            },
-        )?;
-        super::prune_history(root, &config);
-    } else {
-        write_truth()?;
-        uv.sync_prod(root, &config)?;
-    }
+    super::production::commit(
+        root,
+        if existing {
+            OpKind::Reinit
+        } else {
+            OpKind::Init
+        },
+        &python,
+        None,
+        |record| safety_guards::backup_config(record, root),
+        |write| {
+            write_truth()?;
+            write.sync(&config, &uv)
+        },
+    )?;
+    super::prune_history(root, &config);
     println!("Initialized production environment for Python {python}.");
     Ok(())
 }

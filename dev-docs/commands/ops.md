@@ -13,8 +13,9 @@ the requested record strictly. `status` also shows pending operation IDs.
 
 ## `gov op recover <op_id>`
 
-Stop the managed production runtime before recovering. Recovery checks that the
-recorded owner and any external command have exited.
+Stop the managed production runtime before recovering. Recovery takes the same
+production lock as runtime startup and writers, then checks that the recorded
+owner and any external command have exited.
 
 - A prepared operation has backups and has yet to write production. Close it as
   failed and clean any staged import recovery area.
@@ -39,5 +40,5 @@ registry hashes with its recorded post-write hashes. Drift blocks the undo.
 Back up the current truth and affected source first. Restore the target backup
 and sync the production venv. Commit the undo operation before marking the
 original operation undone. If the link fails, retry undo or run `op recover`
-for the new operation. A successful environment import and a reinitialization
-are excluded from ordinary undo.
+for the new operation. Environment import, initialization, reinitialization,
+node registration and startup sync are excluded from ordinary undo.

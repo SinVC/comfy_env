@@ -14,6 +14,11 @@ pub use process::{
     CandidateProcess, RunInterrupts, check_process_alive, exit_code, process_creation,
     terminate_process,
 };
+#[cfg(target_os = "linux")]
+pub use process::{
+    install_supervisor_signals, interrupt_supervisor, production_group_alive, stop_supervised,
+    supervise_production,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProcessIdentity {
@@ -30,6 +35,17 @@ impl ProcessIdentity {
     }
 
     pub fn is_alive(&self) -> anyhow::Result<bool> {
+        #[cfg(windows)]
+        {
+            use anyhow::Context;
+            process::verified_is_alive(self).with_context(|| {
+                format!(
+                    "cannot verify process {}; check its identity and permissions",
+                    self.pid
+                )
+            })
+        }
+        #[cfg(unix)]
         Ok(check_process_alive(self.pid)?
             && process_creation(self.pid)?.as_ref() == Some(&self.creation))
     }
@@ -41,7 +57,39 @@ impl ProcessIdentity {
 
 pub struct PythonClient;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PythonIdentity {
+    pub base_executable: String,
+    implementation: String,
+    version: String,
+}
+
 impl PythonClient {
+    pub fn identity(interpreter: &Path) -> anyhow::Result<PythonIdentity> {
+        let output = Command::new(interpreter)
+            .args([
+                "-I",
+                "-S",
+                "-B",
+                "-c",
+                "import json, sys; print(json.dumps([sys._base_executable, sys.implementation.name, sys.version]))",
+            ])
+            .output()?;
+        let result = crate::domain::CmdResult::from_output(output);
+        anyhow::ensure!(
+            result.success,
+            "python identity lookup failed: {}",
+            result.summary_line()
+        );
+        let (base, implementation, version): (PathBuf, String, String) =
+            serde_json::from_str(&result.stdout)?;
+        Ok(PythonIdentity {
+            base_executable: to_state_path(&base.canonicalize()?),
+            implementation,
+            version,
+        })
+    }
+
     pub fn version_minor(interpreter: &Path) -> anyhow::Result<String> {
         let output = Command::new(interpreter)
             .args([

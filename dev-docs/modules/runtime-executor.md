@@ -3,9 +3,11 @@
 [Implementation](../../src/runtime_executor/)
 
 The runtime executor starts and reaps ComfyUI with platform-specific process
-control. Production uses the PID lock for launch, stop and cleanup. PID records
-contain the PID and host creation identity. Linux reads boot ID and start time
-and stops through a PID file descriptor. Windows reads process creation time and
+control. Production launch, stop, writes and recovery share the production lock.
+PID records contain the PID and host creation identity. Linux uses a supervisor
+as process group leader and verifies its boot ID and start time before signaling
+it through a PID file descriptor. The supervisor remains until the group empties.
+Windows reads process creation time and
 verifies and terminates through the same process handle. The Windows
 production launcher waits for the PID record before starting the interpreter
 inside a Job Object. Stop waits for that job to empty, including when venv

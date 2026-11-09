@@ -11,6 +11,7 @@ use crate::toml_support;
 
 pub fn cmd_update_run(args: UpdateRunArgs, root: &ProjectRoot) -> AppResult<()> {
     let (config, uv) = super::configured_uv(root)?;
+    let comfy = super::runtime::configured_entry(root, &config)?;
     let torch = toml_support::read_dependency_group(&root.pyproject_toml(), "torch")?;
     if !TORCH_FAMILY.iter().all(|name| {
         torch
@@ -23,12 +24,7 @@ pub fn cmd_update_run(args: UpdateRunArgs, root: &ProjectRoot) -> AppResult<()> 
     }
     let requirements = match args.requirements_file {
         Some(path) => path,
-        None => config
-            .paths
-            .comfyui_dir
-            .as_ref()
-            .ok_or_else(|| AppError::usage("config.toml is missing paths.comfyui_dir"))?
-            .join("requirements.txt"),
+        None => comfy.join("requirements.txt"),
     };
     if !requirements.is_file() {
         return Err(AppError::usage(format!(
@@ -62,15 +58,10 @@ pub fn cmd_update_run(args: UpdateRunArgs, root: &ProjectRoot) -> AppResult<()> 
         source_requirements_sha256: Some(source_hash),
         ..Default::default()
     };
+    super::tx::prepare_transaction(stage.path(), &GroupName("core".into()), &tx)?;
     super::tx::begin_observation(root, &mut tx, baseline)?;
     let stage_path = stage.persist();
-    let locked = match super::tx::stage_transaction(
-        &stage_path,
-        &GroupName("core".into()),
-        &uv,
-        root,
-        &mut tx,
-    ) {
+    let locked = match super::tx::lock_transaction(&stage_path, &uv, root, &mut tx) {
         Ok(locked) => locked,
         Err(error) => {
             super::tx::mark_failed(root, &mut tx, &error)?;
@@ -88,6 +79,7 @@ pub fn cmd_update_run(args: UpdateRunArgs, root: &ProjectRoot) -> AppResult<()> 
         &mut tx,
         &stage_path,
         args.timeout.unwrap_or(config.tx.timeout_seconds),
+        TxStatus::Completed,
     )?;
     println!("Update {}: {}", tx.id, tx.status.unwrap());
     Ok(())
@@ -118,24 +110,16 @@ pub fn cmd_update_resolve(args: UpdateResolveArgs, root: &ProjectRoot) -> AppRes
     }
     super::pin::merge_resolution_pins(&mut tx, pins, args.override_requirements)?;
     let (config, uv) = super::configured_uv(root)?;
+    super::runtime::configured_entry(root, &config)?;
 
-    let old_stage = std::mem::take(&mut tx.staged_workdir);
-    let baseline = super::tx::truth_hashes(root.as_path())?;
-    let stage = dependency_sync::create_staged_workdir(root)?;
-    tx.staged_workdir = platform::to_state_path(stage.path());
-    super::tx::begin_observation(root, &mut tx, baseline)?;
-    let stage = stage.persist();
-    if let Err(error) = super::tx::remove_tx_artifact(&old_stage, &root.work_dir()) {
-        eprintln!("warning: failed to clean old stage: {error:#}");
-    }
-    let locked =
-        match super::tx::stage_transaction(&stage, &GroupName("core".into()), &uv, root, &mut tx) {
-            Ok(locked) => locked,
-            Err(error) => {
-                super::tx::mark_failed(root, &mut tx, &error)?;
-                return Err(error.into());
-            }
-        };
+    let stage = super::tx::restage_resolution(root, &GroupName("core".into()), &mut tx)?;
+    let locked = match super::tx::lock_transaction(&stage, &uv, root, &mut tx) {
+        Ok(locked) => locked,
+        Err(error) => {
+            super::tx::mark_failed(root, &mut tx, &error)?;
+            return Err(error.into());
+        }
+    };
     if !locked {
         println!("Update still needs resolution: {}", tx.id);
         if !args.override_requirements {
@@ -152,11 +136,8 @@ pub fn cmd_update_resolve(args: UpdateResolveArgs, root: &ProjectRoot) -> AppRes
         &mut tx,
         &stage,
         config.tx.timeout_seconds,
+        TxStatus::Resolved,
     )?;
-    if tx.status == Some(TxStatus::Completed) {
-        tx.status = Some(TxStatus::Resolved);
-        state_ledger::save_transaction(root, &tx)?;
-    }
     println!("Update {}: {}", tx.id, tx.status.unwrap());
     Ok(())
 }
@@ -167,8 +148,9 @@ pub fn cmd_update_promote(args: UpdatePromoteArgs, root: &ProjectRoot) -> AppRes
     if super::production::resume_link(root, OpKind::CorePromote, &tx.id)? {
         return Ok(());
     }
+    crate::safety_guards::ensure_production_recoverable(root)?;
     let (config, uv) = super::configured_uv(root)?;
-    let stage = super::tx::check_snapshot(
+    let (stage, uv) = super::tx::check_snapshot(
         root,
         &config,
         &uv,
@@ -187,11 +169,7 @@ pub fn cmd_update_promote(args: UpdatePromoteArgs, root: &ProjectRoot) -> AppRes
         &tx.id,
         Some(promotion),
         |_| Ok(()),
-        |write| {
-            dependency_sync::promote_staged_path(&stage, root)?;
-            write.sync(&config, &uv)?;
-            write.smoke(&config, false)
-        },
+        |write| super::tx::apply_snapshot(root, &config, &uv, &tx, &stage, write),
     )?;
     super::prune_history(root, &config);
     println!("Update promoted: {}", tx.id);

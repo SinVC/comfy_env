@@ -65,15 +65,10 @@ pub fn cmd_tx_run(args: TxRunArgs, root: &ProjectRoot) -> AppResult<()> {
         observed_requirements: requirements,
         ..Default::default()
     };
+    prepare_transaction(stage.path(), &GroupName(plugin.group.clone()), &tx)?;
     begin_observation(root, &mut tx, baseline)?;
     let stage_path = stage.persist();
-    let locked = match stage_transaction(
-        &stage_path,
-        &GroupName(plugin.group.clone()),
-        &uv,
-        root,
-        &mut tx,
-    ) {
+    let locked = match lock_transaction(&stage_path, &uv, root, &mut tx) {
         Ok(locked) => locked,
         Err(error) => {
             mark_failed(root, &mut tx, &error)?;
@@ -91,6 +86,7 @@ pub fn cmd_tx_run(args: TxRunArgs, root: &ProjectRoot) -> AppResult<()> {
         &mut tx,
         &stage_path,
         args.timeout.unwrap_or(config.tx.timeout_seconds),
+        TxStatus::Completed,
     )?;
     println!("Transaction {}: {}", tx.id, tx.status.unwrap());
     Ok(())
@@ -107,13 +103,11 @@ pub(crate) fn mark_failed(
     state_ledger::save_transaction(root, tx)
 }
 
-pub(crate) fn stage_transaction(
+pub(crate) fn prepare_transaction(
     stage: &Path,
     group: &GroupName,
-    uv: &UvClient,
-    root: &ProjectRoot,
-    tx: &mut TransactionRecord,
-) -> Result<bool> {
+    tx: &TransactionRecord,
+) -> AppResult<()> {
     let project_path = stage.join("pyproject.toml");
     let project = toml_support::read_project(&project_path)?;
     let group =
@@ -124,7 +118,39 @@ pub(crate) fn stage_transaction(
         GroupEditMode::Replace,
         &tx.observed_requirements,
     )?;
-    super::pin::apply_resolution_pins(&project_path, tx)?;
+    super::pin::apply_resolution_pins(&project_path, tx)
+}
+
+pub(crate) fn restage_resolution(
+    root: &ProjectRoot,
+    group: &GroupName,
+    tx: &mut TransactionRecord,
+) -> AppResult<PathBuf> {
+    let _guard = runtime_executor::try_lock_production(&root.pid_file())?;
+    let current = state_ledger::load_transaction(root, &TxId(tx.id.clone()))?;
+    if current.status != Some(TxStatus::NeedsResolution) || current.attempt != tx.attempt {
+        return Err(AppError::usage(
+            "transaction changed while preparing resolution; inspect it and retry",
+        ));
+    }
+    let baseline = truth_hashes(root.as_path())?;
+    let stage = dependency_sync::create_staged_workdir(root)?;
+    prepare_transaction(stage.path(), group, tx)?;
+    tx.staged_workdir = platform::to_state_path(stage.path());
+    begin_observation(root, tx, baseline)?;
+    let stage = stage.persist();
+    if let Err(error) = remove_tx_artifact(&current.staged_workdir, &root.work_dir()) {
+        eprintln!("warning: failed to clean old stage: {error:#}");
+    }
+    Ok(stage)
+}
+
+pub(crate) fn lock_transaction(
+    stage: &Path,
+    uv: &UvClient,
+    root: &ProjectRoot,
+    tx: &mut TransactionRecord,
+) -> Result<bool> {
     let lock = uv.lock_tracked(stage, root, |process| {
         tx.candidate_process = process;
         state_ledger::save_transaction(root, tx)
@@ -180,6 +206,7 @@ pub(crate) fn observe_candidate(
     tx: &mut TransactionRecord,
     stage: &Path,
     timeout: u32,
+    passed_status: TxStatus,
 ) -> Result<()> {
     use ObservationOutcome as Outcome;
     let candidate = root
@@ -196,6 +223,7 @@ pub(crate) fn observe_candidate(
     tx.logs.stderr = platform::to_state_path(&stderr);
     let mut observation = Observation {
         outcome: Outcome::InfrastructureFailed,
+        interpreter: None,
         candidate_before: Vec::new(),
         package_drift: PackageDiff::default(),
         node_failures: Vec::new(),
@@ -230,6 +258,8 @@ pub(crate) fn observe_candidate(
         );
         tx.candidate_ready = true;
         observation.outcome = Outcome::InfrastructureFailed;
+        let python = platform::venv_python(&candidate);
+        let interpreter = platform::PythonClient::identity(&python)?;
         observation.candidate_before = freeze(uv, &candidate)?;
         let comfy = config
             .paths
@@ -260,6 +290,11 @@ pub(crate) fn observe_candidate(
             RunOutcome::Interrupted => {}
         }
         tx.post_freeze = freeze(uv, &candidate)?;
+        ensure!(
+            platform::PythonClient::identity(&python)? == interpreter,
+            "candidate interpreter changed during observation"
+        );
+        observation.interpreter = Some(interpreter);
         tx.diff = freeze_diff(&tx.pre_freeze, &tx.post_freeze);
         tx.core_impact = core_impact(&tx.diff, config);
         observation.package_drift = freeze_diff(&observation.candidate_before, &tx.post_freeze);
@@ -323,7 +358,7 @@ pub(crate) fn observe_candidate(
         Err(error) => tx.logs.failure = Some(format!("{error:#}")),
     }
     tx.status = Some(if observation.outcome == Outcome::Passed {
-        TxStatus::Completed
+        passed_status
     } else {
         TxStatus::Failed
     });
@@ -353,7 +388,7 @@ pub(crate) fn check_snapshot(
     tx: &TransactionRecord,
     allow_failed: bool,
     approve_core: bool,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, UvClient)> {
     const RERUN: &str = "run a fresh transaction or resolve the conflict and observe again";
     let observation = tx
         .observation
@@ -404,13 +439,57 @@ pub(crate) fn check_snapshot(
         observation.candidate_before == tx.post_freeze,
         "candidate package set drifted; {RERUN}"
     );
+    let interpreter = observation
+        .interpreter
+        .as_ref()
+        .with_context(|| format!("transaction has no interpreter evidence; {RERUN}"))?;
+    let (pinned_uv, current) = uv
+        .resolved_python()
+        .with_context(|| format!("could not verify the promotion interpreter; {RERUN}"))?;
+    ensure!(
+        current == *interpreter,
+        "resolved Python interpreter changed after observation; {RERUN}"
+    );
     let impact = core_impact(&freeze_diff(&tx.pre_freeze, &tx.post_freeze), config);
     ensure!(
         impact.is_empty() || approve_core,
         "core impact requires --approve-core: {}",
         impact.join(", ")
     );
-    Ok(stage)
+    Ok((stage, pinned_uv))
+}
+
+pub(super) fn apply_snapshot(
+    root: &ProjectRoot,
+    config: &RuntimeConfig,
+    uv: &UvClient,
+    tx: &TransactionRecord,
+    stage: &Path,
+    write: &mut super::production::ProductionWrite<'_>,
+) -> Result<()> {
+    let env = root.as_path().join(&config.runtime.prod_env);
+    let python = platform::venv_python(&env);
+    let previous = if env.try_exists()? {
+        Some(platform::PythonClient::identity(&python)?)
+    } else {
+        None
+    };
+    dependency_sync::promote_staged_path(stage, root)?;
+    write.sync_with_previous_python(config, uv, previous)?;
+    write.smoke(config, false)?;
+    let actual = platform::PythonClient::identity(&python)?;
+    ensure!(
+        tx.observation
+            .as_ref()
+            .and_then(|obs| obs.interpreter.as_ref())
+            == Some(&actual),
+        "production interpreter differs from the observed candidate"
+    );
+    ensure!(
+        freeze(uv, &env)? == tx.post_freeze,
+        "production package set differs from the observed candidate"
+    );
+    Ok(())
 }
 
 pub(crate) fn freeze_diff(before: &[String], after: &[String]) -> PackageDiff {
@@ -461,8 +540,8 @@ fn read_plugin_requirements(path: &Path) -> AppResult<Vec<String>> {
     let contents = fs::read_to_string(path)?;
     let mut specs = Vec::new();
     for (index, line) in contents.lines().enumerate() {
-        let value = line.split(" #").next().unwrap_or("").trim();
-        if value.is_empty() || value.starts_with('#') {
+        let value = super::install::requirement_text(line);
+        if value.is_empty() {
             continue;
         }
         let name = toml_support::normalize_package_name(value);
@@ -550,6 +629,9 @@ fn print_promotion(root: &ProjectRoot, tx: &TransactionRecord) {
             op_id,
             promotion.reason.as_deref().unwrap_or_default()
         );
+        if let Some(error) = &promotion.error {
+            println!("Promotion failure: {error}");
+        }
         if !op_id.is_empty()
             && let Ok(operation) =
                 state_ledger::load_operation(root, &crate::domain::OpId(op_id.to_owned()))
@@ -573,6 +655,9 @@ fn print_observation(tx: &TransactionRecord) {
             observation.package_drift.added.join(", "),
             observation.package_drift.removed.join(", "),
         );
+        if let Some(interpreter) = &observation.interpreter {
+            println!("Observed Python: {}", interpreter.base_executable);
+        }
     }
     if let Some(error) = &tx.logs.failure {
         println!("Observation error: {error}");
@@ -641,18 +726,7 @@ pub(crate) fn abort(
         return Err(AppError::usage("candidate process tree is still running"));
     }
     let config = super::configured(root)?;
-    if !tx.candidate_env.is_empty() {
-        let path = platform::from_state_path(&tx.candidate_env);
-        if path.file_name() != Some(std::ffi::OsStr::new(&tx.id)) {
-            return Err(AppError::usage(
-                "candidate path does not belong to this transaction",
-            ));
-        }
-    }
-    remove_tx_artifact(
-        &tx.candidate_env,
-        &root.as_path().join(&config.runtime.candidate_root),
-    )?;
+    remove_candidate(root, &config, tx)?;
     remove_tx_artifact(&tx.staged_workdir, &root.work_dir())?;
     tx.status = Some(TxStatus::Aborted);
     tx.updated_at = Some(state_ledger::now_string()?);
@@ -666,8 +740,9 @@ pub fn cmd_tx_promote(args: TxPromoteArgs, root: &ProjectRoot) -> AppResult<()> 
     if super::production::resume_link(root, OpKind::PluginPromote, &tx.id)? {
         return Ok(());
     }
+    crate::safety_guards::ensure_production_recoverable(root)?;
     let (config, uv) = super::configured_uv(root)?;
-    let stage = check_snapshot(
+    let (stage, uv) = check_snapshot(
         root,
         &config,
         &uv,
@@ -699,9 +774,7 @@ pub fn cmd_tx_promote(args: TxPromoteArgs, root: &ProjectRoot) -> AppResult<()> 
         Some(promotion),
         |_| Ok(()),
         |write| {
-            dependency_sync::promote_staged_path(&stage, root)?;
-            write.sync(&config, &uv)?;
-            write.smoke(&config, false)?;
+            apply_snapshot(root, &config, &uv, &tx, &stage, write)?;
             if let Some(entry) = plugins.iter_mut().find(|p| p.id == plugin.id) {
                 entry.managed_deps = tx.observed_requirements.clone();
                 entry.updated_at = state_ledger::now_string()?;
@@ -715,17 +788,30 @@ pub fn cmd_tx_promote(args: TxPromoteArgs, root: &ProjectRoot) -> AppResult<()> 
 }
 
 pub(crate) fn clean_artifacts(root: &ProjectRoot, config: &RuntimeConfig, tx: &TransactionRecord) {
-    for (path, base) in [
-        (
-            &tx.candidate_env,
-            root.as_path().join(&config.runtime.candidate_root),
-        ),
-        (&tx.staged_workdir, root.work_dir()),
-    ] {
-        if let Err(error) = remove_tx_artifact(path, &base) {
-            eprintln!("warning: failed to clean {path}: {error:#}");
-        }
+    if let Err(error) = remove_candidate(root, config, tx) {
+        eprintln!("warning: failed to clean {}: {error:#}", tx.candidate_env);
     }
+    if let Err(error) = remove_tx_artifact(&tx.staged_workdir, &root.work_dir()) {
+        eprintln!("warning: failed to clean {}: {error:#}", tx.staged_workdir);
+    }
+}
+
+fn remove_candidate(
+    root: &ProjectRoot,
+    config: &RuntimeConfig,
+    tx: &TransactionRecord,
+) -> Result<()> {
+    if !tx.candidate_env.is_empty() {
+        let path = platform::from_state_path(&tx.candidate_env);
+        ensure!(
+            path.file_name() == Some(std::ffi::OsStr::new(&tx.id)),
+            "candidate path does not belong to this transaction"
+        );
+    }
+    remove_tx_artifact(
+        &tx.candidate_env,
+        &root.as_path().join(&config.runtime.candidate_root),
+    )
 }
 
 pub(crate) fn remove_tx_artifact(recorded: &str, base: &Path) -> Result<()> {

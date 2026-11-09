@@ -14,7 +14,7 @@ Wraps all `uv` invocations. Never called directly by application code — always
 
 ```rust
 struct UvClient {
-    python: String,        // configured Python minor line
+    python: String,        // uv selector or resolved interpreter path
 }
 ```
 

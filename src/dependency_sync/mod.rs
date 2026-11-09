@@ -44,6 +44,22 @@ impl UvClient {
         run_uv(uv_command().args(["python", "find", "--no-python-downloads", selector]))
     }
 
+    pub fn resolved_python(&self) -> Result<(Self, crate::platform::PythonIdentity)> {
+        let found = Self::find_python(&self.python)?;
+        ensure!(
+            found.success,
+            "Python lookup failed: {}",
+            found.summary_line()
+        );
+        let executable = Path::new(&found.stdout);
+        ensure!(
+            executable.is_absolute(),
+            "uv did not return an absolute interpreter path"
+        );
+        let identity = crate::platform::PythonClient::identity(executable)?;
+        Ok((Self::new(found.stdout), identity))
+    }
+
     pub fn resolve_python_minor(selector: &str) -> Result<String> {
         let selector = selector.trim();
         ensure!(!selector.is_empty(), "Python selector must not be empty");
@@ -127,11 +143,6 @@ impl UvClient {
     ) -> Result<()> {
         let env_path = root.as_path().join(&config.runtime.prod_env);
         check_sync(self.sync_tracked(root.as_path(), &env_path, record)?)
-    }
-
-    pub fn sync_prod(&self, root: &ProjectRoot, config: &RuntimeConfig) -> Result<()> {
-        let env_path = root.as_path().join(&config.runtime.prod_env);
-        check_sync(run_uv(&mut self.sync_command(root.as_path(), &env_path)?)?)
     }
 
     pub fn pip_freeze(&self, env_path: &Path) -> Result<Vec<String>> {

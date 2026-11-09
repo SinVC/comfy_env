@@ -110,7 +110,10 @@ pub fn op_finalize(
         OpStatus::Failed
     };
     record.undoable = success;
-    if matches!(record.kind, OpKind::EnvImport | OpKind::Reinit) {
+    if matches!(
+        record.kind,
+        OpKind::EnvImport | OpKind::Reinit | OpKind::Init | OpKind::RuntimeSync | OpKind::NodeAdd
+    ) {
         record.undoable = false;
     }
     record.ended_at = Some(state_ledger::now_string()?);
@@ -212,7 +215,7 @@ pub fn verify_backup(op_id: &OpId, root: &ProjectRoot, source_touched: bool) -> 
     {
         match record.kind {
             OpKind::EnvImport => node_swap::verify_journal(root, op_id)?,
-            OpKind::NodeRemove | OpKind::ManualUndo => ensure!(
+            OpKind::NodeRemove | OpKind::ManualUndo | OpKind::NodeAdd => ensure!(
                 backup.join("custom_node.path").is_file(),
                 "missing custom node recovery evidence"
             ),
@@ -264,6 +267,20 @@ pub fn verify_backup(op_id: &OpId, root: &ProjectRoot, source_touched: bool) -> 
 pub fn backup_custom_node(op_id: &OpId, source: &Path, root: &ProjectRoot) -> Result<()> {
     let backup = root.ops_dir().join(&op_id.0).join("backup");
     crate::source_integration::copy_plugin_source(source, &backup.join("custom_node"))?;
+    crate::fs_support::atomic_write(
+        &backup.join("custom_node.path"),
+        crate::platform::to_state_path(source).as_bytes(),
+    )
+}
+
+pub fn backup_absent_node(op_id: &OpId, source: &Path, root: &ProjectRoot) -> Result<()> {
+    ensure!(
+        crate::fs_support::metadata_if_exists(source)?.is_none(),
+        "node source already exists: {}",
+        source.display()
+    );
+    let backup = root.ops_dir().join(&op_id.0).join("backup");
+    crate::fs_support::atomic_write(&backup.join("custom_node.exists"), b"0")?;
     crate::fs_support::atomic_write(
         &backup.join("custom_node.path"),
         crate::platform::to_state_path(source).as_bytes(),

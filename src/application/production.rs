@@ -25,6 +25,15 @@ impl ProductionWrite<'_> {
     }
 
     pub(super) fn sync(&mut self, config: &RuntimeConfig, uv: &UvClient) -> Result<()> {
+        self.sync_with_previous_python(config, uv, None)
+    }
+
+    pub(super) fn sync_with_previous_python(
+        &mut self,
+        config: &RuntimeConfig,
+        uv: &UvClient,
+        previous_python: Option<platform::PythonIdentity>,
+    ) -> Result<()> {
         let path = self.root.as_path().join(&config.runtime.prod_env);
         let existed = path.try_exists()?;
         if !existed {
@@ -33,6 +42,7 @@ impl ProductionWrite<'_> {
         self.operation.recovery.as_mut().unwrap().sync = Some(EnvironmentRecovery {
             path: platform::to_state_path(&path),
             existed,
+            previous_python,
         });
         state_ledger::save_operation(self.root, self.operation)?;
         uv.sync_prod_tracked(self.root, config, |process| self.record_process(process))
@@ -261,16 +271,32 @@ fn restore_resources(root: &ProjectRoot, id: &OpId, operation: &mut OperationRec
                 root.as_path().join(&config.runtime.prod_env) == path,
                 "previous configuration has a different production environment"
             );
-            let python = config
+            let configured = config
                 .runtime
                 .python
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
                 .context("missing previous Python for recovery sync")?;
+            let python = if let Some(identity) = &sync.previous_python {
+                let pinned = platform::from_state_path(&identity.base_executable);
+                ensure!(
+                    platform::PythonClient::identity(&pinned)? == *identity,
+                    "previous production interpreter changed; restore it before retrying recovery"
+                );
+                pinned.to_string_lossy().into_owned()
+            } else {
+                configured.to_owned()
+            };
             let mut write = ProductionWrite { root, operation };
             UvClient::new(python)
                 .sync_prod_tracked(root, &config, |process| write.record_process(process))
                 .context("recovery sync failed")?;
+            if let Some(identity) = &sync.previous_python {
+                ensure!(
+                    platform::PythonClient::identity(&platform::venv_python(&path))? == *identity,
+                    "recovery sync did not restore the previous production interpreter"
+                );
+            }
         }
     }
     Ok(())

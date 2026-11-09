@@ -1,19 +1,18 @@
-use anyhow::{Result, bail};
-
 use crate::cli::{NodeAddArgs, NodeRemoveArgs};
 use crate::dependency_sync;
-use crate::domain::{AppError, AppResult, NodeId, ProjectRoot};
+use crate::domain::{AppError, AppResult, NodeId, OpId, ProjectRoot};
 use crate::safety_guards;
 use crate::source_integration::{self, GitClient};
 use crate::state_ledger::{self, OpKind, PluginRecord};
 use crate::toml_support;
 
 pub fn cmd_node_add(args: NodeAddArgs, root: &ProjectRoot) -> AppResult<()> {
-    safety_guards::ensure_production_recoverable(root)?;
     let config = super::configured(root)?;
     let comfy = config
         .paths
         .comfyui_dir
+        .as_deref()
+        .filter(|path| !path.as_os_str().is_empty())
         .ok_or_else(|| AppError::usage("config.toml is missing paths.comfyui_dir"))?;
     if !comfy.is_dir() {
         return Err(AppError::usage(format!(
@@ -44,8 +43,8 @@ pub fn cmd_node_add(args: NodeAddArgs, root: &ProjectRoot) -> AppResult<()> {
             "dependency group {existing} already exists without a registered owner"
         )));
     }
-    let target = source_integration::plugin_install_path(&comfy, &NodeId(id.clone()));
-    if target.exists() {
+    let target = source_integration::plugin_install_path(comfy, &NodeId(id.clone()));
+    if crate::fs_support::metadata_if_exists(&target)?.is_some() {
         return Err(AppError::usage(format!(
             "node source already exists: {}",
             target.display()
@@ -58,43 +57,64 @@ pub fn cmd_node_add(args: NodeAddArgs, root: &ProjectRoot) -> AppResult<()> {
             git.summary_line()
         )));
     }
-    crate::runtime_executor::ensure_prod_stopped(&root.pid_file())?;
-    std::fs::create_dir_all(comfy.join("custom_nodes"))?;
-    let cloned = (|| -> Result<()> {
-        let result = GitClient::clone(&args.git_url, &target)?;
-        if !result.success {
-            bail!("git clone failed: {}", result.summary_line());
-        }
-        if let Some(reference) = &args.ref_name {
-            let result = GitClient::checkout(&target, reference)?;
-            if !result.success {
-                bail!("git checkout failed: {}", result.summary_line());
-            }
-        }
-        let now = state_ledger::now_string()?;
-        plugins.push(PluginRecord {
-            id: id.clone(),
-            enabled: true,
-            git_url: args.git_url,
-            git_ref: args.ref_name.unwrap_or_else(|| "HEAD".to_string()),
-            install_relpath: format!("custom_nodes/{id}"),
-            group,
-            managed_deps: Vec::new(),
-            created_at: now.clone(),
-            updated_at: now,
-        });
-        state_ledger::save_plugins(root, &plugins)
-    })();
-    if let Err(error) = cloned {
-        if target.exists() {
-            if let Err(cleanup) = source_integration::remove_plugin_source(&target) {
-                return Err(AppError::runtime(format!(
-                    "{error:#}; clone cleanup failed: {cleanup:#}"
-                )));
-            }
-        }
-        return Err(error.into());
+    let nodes = comfy.join("custom_nodes");
+    let stage_parent = if crate::fs_support::metadata_if_exists(&nodes)?
+        .is_some_and(|metadata| crate::fs_support::is_link(&metadata))
+    {
+        nodes
+            .canonicalize()?
+            .parent()
+            .ok_or_else(|| AppError::usage("linked custom_nodes has no parent for staging"))?
+            .to_path_buf()
+    } else {
+        comfy.to_path_buf()
+    };
+    let stage = tempfile::Builder::new()
+        .prefix(".gov-node-")
+        .tempdir_in(stage_parent)?;
+    let checkout = stage.path().join(&id);
+    let result = GitClient::clone(&args.git_url, &checkout)?;
+    if !result.success {
+        return Err(AppError::runtime(format!(
+            "git clone failed: {}",
+            result.summary_line()
+        )));
     }
+    if let Some(reference) = &args.ref_name {
+        let result = GitClient::checkout(&checkout, reference)?;
+        if !result.success {
+            return Err(AppError::runtime(format!(
+                "git checkout failed: {}",
+                result.summary_line()
+            )));
+        }
+    }
+    let now = state_ledger::now_string()?;
+    plugins.push(PluginRecord {
+        id: id.clone(),
+        enabled: true,
+        git_url: args.git_url,
+        git_ref: args.ref_name.unwrap_or_else(|| "HEAD".to_string()),
+        install_relpath: format!("custom_nodes/{id}"),
+        group,
+        managed_deps: Vec::new(),
+        created_at: now.clone(),
+        updated_at: now,
+    });
+    super::production::commit(
+        root,
+        OpKind::NodeAdd,
+        &id,
+        None,
+        |op| safety_guards::backup_absent_node(&OpId(op.op_id.clone()), &target, root),
+        |write| {
+            std::fs::create_dir_all(&nodes)?;
+            write.touch_source()?;
+            crate::fs_support::move_entry(&checkout, &target)?;
+            state_ledger::save_plugins(root, &plugins)
+        },
+    )?;
+    super::prune_history(root, &config);
     println!("Node registered: {id}");
     Ok(())
 }

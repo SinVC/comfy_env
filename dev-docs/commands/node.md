@@ -14,7 +14,7 @@ gov node add <git_url> [--ref <sha|tag|branch>] [--id <node_id>]
 
 ### Purpose
 
-Register a ComfyUI plugin by cloning its Git repository into `custom_nodes/`. Does not install dependencies — that requires a subsequent `tx run`.
+Register a ComfyUI plugin by staging its Git checkout outside the scanned node tree, then publishing it under `custom_nodes/`. Dependencies are observed by a subsequent `tx run`.
 
 ### Arguments
 
@@ -47,10 +47,10 @@ Register a ComfyUI plugin by cloning its Git repository into `custom_nodes/`. Do
 1. Derive node_id from git_url basename (or use --id)
 2. Verify node_id not already registered
 3. Determine install path: <comfyui_dir>/custom_nodes/<node_id>
-4. `git clone <git_url> <install_path>`
-5. IF --ref provided: `git -C <install_path> checkout <ref>`
+4. Clone into a temporary checkout outside custom_nodes.
+5. IF --ref provided: checkout the ref in the temporary checkout.
 6. Generate group name: "node-<normalized_node_id>"
-7. Append to plugins.json:
+7. Start the node_add operation, publish the checkout and append to plugins.json:
    {
      id: node_id,
      git_url: git_url,
@@ -70,6 +70,7 @@ Register a ComfyUI plugin by cloning its Git repository into `custom_nodes/`. Do
 IF duplicate node_id: exit with error (no mutation)
 IF the target already exists, preserve its contents. Clean up a partial clone only when this invocation created the directory.
 IF git checkout fails: clean up cloned directory, exit
+IF publication or registry update fails: restore through the operation backup.
 ```
 
 ### Platform Notes

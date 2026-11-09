@@ -66,7 +66,7 @@ fn list_transactions() -> Result<Vec<TransactionRecord>>
 
 **Fields populated during promote/resolve**:
 - `resolution_pins` and optional `resolution_overrides` (resolve), `promotion` (promote), `conflict_report` (lock failure)
-- Optional owner and candidate identities support stale cleanup. The optional observation records outcome, pre-run candidate freeze, package drift and node load failures. `attempt` distinguishes retry logs.
+- Optional owner and candidate identities support stale cleanup. The optional observation records outcome, interpreter identity, pre-run candidate freeze, package drift and node load failures. `attempt` distinguishes retry logs.
 - Inspect/read layers may annotate missing artifact paths as `(cleaned)` for promoted/aborted transactions or `(missing)` for other states, but they do not rewrite the stored JSON fields
 
 ### 2. Operation Records
@@ -84,7 +84,7 @@ fn prune_operations(retention_count: u32) -> Result<u32>
 ```json
 {
   "op_id": "20260419T120000Z-op-e5f6a7b8",
-  "kind": "install_torch|install_core|pin_add|pin_remove|node_remove|plugin_promote|core_promote|update_promote|env_import|manual_undo|reinit",
+  "kind": "install_torch|install_core|pin_add|pin_remove|node_add|node_remove|plugin_promote|core_promote|update_promote|env_import|manual_undo|init|reinit|runtime_sync",
   "reference": "txid or node_id or description",
   "status": "running|success|failed|undone",
   "started_at": "ISO8601",
@@ -109,7 +109,8 @@ fn prune_operations(retention_count: u32) -> Result<u32>
 The optional `recovery` payload records the owner, active external process,
 phase, touched source and environment, linked transaction or undo target, and
 separate apply and restore errors. Applying and restore-failed operations
-retain backups. A committed operation can remain pending while a ledger link
+retain backups. Promotion recovery can record the prior production interpreter
+to pin the restore sync. A committed operation can remain pending while a ledger link
 needs repair. Old running operations without a recovery payload require manual
 inspection. Batch queries and pruning warn and skip damaged records. Exact
 reads and production recovery remain strict.

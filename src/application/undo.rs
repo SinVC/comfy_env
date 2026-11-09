@@ -6,12 +6,13 @@ use crate::safety_guards::{self, DriftCheck};
 use crate::state_ledger::{self, OpKind};
 
 pub fn cmd_undo(args: UndoArgs, root: &ProjectRoot) -> AppResult<()> {
-    let (config, uv) = super::configured_uv(root)?;
     let target_id = OpId(args.op_id);
     let reference = format!("undo:{}", target_id.0);
     if super::production::resume_link(root, OpKind::ManualUndo, &reference)? {
         return Ok(());
     }
+    safety_guards::ensure_production_recoverable(root)?;
+    let (config, uv) = super::configured_uv(root)?;
     let target = state_ledger::load_operation(root, &target_id)?;
 
     if target.status != OpStatus::Success || !target.undoable {

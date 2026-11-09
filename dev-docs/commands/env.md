@@ -9,6 +9,9 @@ of each registered node. The output directory must be new and outside the
 node source trees. The bundle includes `pyproject.toml`, `uv.lock`, the
 registry, `pylock.toml` from `uv export`, and the production freeze and export
 summary under `audit/`. Node snapshots exclude `.git` and reject links.
+Export requires a uv version that supports `uv export --format pylock.toml`.
+uv introduced pylock export in 0.6.15. The release checks cover Windows uv 0.13.7
+and Linux uv 0.10.0. gov checks export before creating the bundle directory.
 The v1 manifest includes SHA-256 hashes for all payload files, requirements,
 platform, architecture and node IDs. An export error cleans its partial output.
 

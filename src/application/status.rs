@@ -96,6 +96,7 @@ pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
 fn config_comfyui_dir(config: Option<&RuntimeConfig>) -> String {
     config
         .and_then(|value| value.paths.comfyui_dir.as_ref())
+        .filter(|path| !path.as_os_str().is_empty())
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "-".to_string())
 }
@@ -103,6 +104,7 @@ fn config_comfyui_dir(config: Option<&RuntimeConfig>) -> String {
 fn config_python(config: Option<&RuntimeConfig>) -> String {
     config
         .and_then(|value| value.runtime.python.as_ref())
+        .filter(|selector| !selector.trim().is_empty())
         .cloned()
         .unwrap_or_else(|| "-".to_string())
 }
@@ -128,7 +130,13 @@ fn describe_probe(result: anyhow::Result<CmdResult>) -> String {
 }
 
 fn python_probe(config: Option<&RuntimeConfig>) -> String {
-    let Some(selector) = config.and_then(|value| value.runtime.python.as_ref()) else {
+    let Some(selector) = config
+        .and_then(|value| value.runtime.python.as_ref())
+        .filter(|selector| !selector.trim().is_empty())
+    else {
+        if config.is_some() {
+            return "runtime.python is not configured".to_string();
+        }
         return "managed by uv during init/run (deferred until config.toml exists)".to_string();
     };
 

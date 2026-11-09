@@ -28,7 +28,7 @@ Parses `config.toml` into a typed struct. Tolerant of missing optional fields (u
 
 **RuntimeConfig fields:**
 - `paths.comfyui_dir: String`
-- `runtime.python: String` (canonical minor line)
+- `runtime.python: String` (uv selector. Init writes the minor line, while env import saves the resolved local interpreter path)
 - `runtime.prod_env: String` (default: ".venv-prod")
 - `runtime.candidate_root: String` (default: ".venv-candidate")
 - `tx.timeout_seconds: u32` (default: 120)

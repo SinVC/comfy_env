@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER, FILETIME, GetLastError,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INVALID_PARAMETER,
+    FILETIME, GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Console::{
     ATTACH_PARENT_PROCESS, AttachConsole, CTRL_BREAK_EVENT, CTRL_C_EVENT, FreeConsole,
@@ -58,15 +58,14 @@ fn handle_creation(process: &impl AsRawHandle) -> io::Result<String> {
 
 pub fn terminate_process(identity: &ProcessIdentity, grace_seconds: u32) -> io::Result<()> {
     let pid = identity.pid;
-    let process = open_process(
-        pid,
-        PROCESS_SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
-    )?;
     let job = open_job(identity, JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE)?;
-    let verified = match &process {
-        Some(process) if handle_creation(process)? == identity.creation => Some(process),
-        _ => None,
+    let process = match verified_process(identity, PROCESS_SYNCHRONIZE | PROCESS_TERMINATE) {
+        Err(error) if job.is_some() && error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            None
+        }
+        result => result?,
     };
+    let verified = process.as_ref();
     if let Some(process) = verified
         && !wait_for_exit(process, 0)?
     {
@@ -243,6 +242,26 @@ pub fn candidate_is_alive(identity: &ProcessIdentity) -> anyhow::Result<bool> {
         return Ok(!wait_job(&job, Duration::ZERO)?);
     }
     identity.is_alive()
+}
+
+pub fn verified_is_alive(identity: &ProcessIdentity) -> io::Result<bool> {
+    match verified_process(identity, PROCESS_SYNCHRONIZE)? {
+        Some(process) => Ok(!wait_for_exit(&process, 0)?),
+        None => Ok(false),
+    }
+}
+
+fn verified_process(identity: &ProcessIdentity, access: u32) -> io::Result<Option<OwnedHandle>> {
+    if process_creation(identity.pid)?.as_ref() != Some(&identity.creation) {
+        return Ok(None);
+    }
+    let process = open_process(identity.pid, access | PROCESS_QUERY_LIMITED_INFORMATION)?;
+    if let Some(process) = process
+        && handle_creation(&process)? == identity.creation
+    {
+        return Ok(Some(process));
+    }
+    Ok(None)
 }
 
 fn open_process(pid: u32, access: u32) -> io::Result<Option<OwnedHandle>> {

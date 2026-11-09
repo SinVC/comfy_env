@@ -48,16 +48,18 @@ override evidence of a live owner or candidate.
 
 ## `gov tx promote <txid> [--approve-core] [--reason <text>] [--allow-failed-run] [--keep-artifacts]`
 
-Verify the current production truth, the staged truth, the current production
-package set, and the node's group against the recorded observation. Recompute
+Verify the current production truth, staged truth, production package set,
+resolved Python interpreter and node group against the recorded observation. Recompute
 the core impact using the current `policy.core_packages`. Approval is required
 for a nonempty intersection. `--reason` is saved with the promotion.
 
 `--allow-failed-run` applies only to an actual nonzero runtime exit after a
 successful candidate sync and valid observation. Missing evidence or drift
 requires a fresh run or resolution. Use the observed lock and its equivalent
-local wheel paths directly. Promotion runs one locked production sync, the
-ordinary smoke command, and the node registry update. The production operation
+local wheel paths directly. Promotion runs one locked production sync with the
+verified interpreter and the ordinary smoke command. If the resulting
+interpreter or package set differs from the observation, restore the backup.
+Update the node registry after these checks pass. The production operation
 commits before the transaction is marked promoted. If its ledger link needs
 repair, use [op recover](ops.md) or retry promotion. Successful promotion cleans
 the candidate and stage unless `--keep-artifacts` is set.

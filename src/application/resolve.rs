@@ -1,6 +1,6 @@
 use crate::cli::ResolveArgs;
 use crate::domain::{AppError, AppResult, GroupName, ProjectRoot, TxId, TxKind, TxStatus};
-use crate::{dependency_sync, platform, state_ledger};
+use crate::state_ledger;
 use std::io::{self, Write};
 
 pub fn cmd_resolve(args: ResolveArgs, root: &ProjectRoot) -> AppResult<()> {
@@ -38,27 +38,9 @@ pub fn cmd_resolve(args: ResolveArgs, root: &ProjectRoot) -> AppResult<()> {
         }
     }
     super::pin::merge_resolution_pins(&mut tx, pins, args.override_requirements)?;
-    let old_stage = platform::from_state_path(&tx.staged_workdir);
-    let baseline = super::tx::truth_hashes(root.as_path())?;
-    let stage = dependency_sync::create_staged_workdir(root)?;
-    tx.staged_workdir = platform::to_state_path(stage.path());
-    super::tx::begin_observation(root, &mut tx, baseline)?;
-    let stage_path = stage.persist();
-    let locked = super::tx::stage_transaction(
-        &stage_path,
-        &GroupName(plugin.group.clone()),
-        &uv,
-        root,
-        &mut tx,
-    );
-    if old_stage != stage_path && old_stage.exists() {
-        if let Err(error) =
-            super::tx::remove_tx_artifact(&platform::to_state_path(&old_stage), &root.work_dir())
-        {
-            eprintln!("warning: failed to clean old stage: {error}");
-        }
-    }
-    let locked = match locked {
+    let stage_path =
+        super::tx::restage_resolution(root, &GroupName(plugin.group.clone()), &mut tx)?;
+    let locked = match super::tx::lock_transaction(&stage_path, &uv, root, &mut tx) {
         Ok(locked) => locked,
         Err(error) => {
             super::tx::mark_failed(root, &mut tx, &error)?;
@@ -81,11 +63,8 @@ pub fn cmd_resolve(args: ResolveArgs, root: &ProjectRoot) -> AppResult<()> {
         &mut tx,
         &stage_path,
         config.tx.timeout_seconds,
+        TxStatus::Resolved,
     )?;
-    if tx.status == Some(TxStatus::Completed) {
-        tx.status = Some(TxStatus::Resolved);
-        state_ledger::save_transaction(root, &tx)?;
-    }
     println!("Transaction {}: {}", tx.id, tx.status.unwrap());
     Ok(())
 }

@@ -22,7 +22,7 @@ use crate::toml_support::{self, RuntimeConfig};
 
 pub fn dispatch(cli: Cli) -> AppResult<i32> {
     let root = ProjectRoot::discover()?;
-    if matches!(
+    let writes_production = matches!(
         &cli.command,
         Commands::Init(_)
             | Commands::Install(_)
@@ -40,8 +40,42 @@ pub fn dispatch(cli: Cli) -> AppResult<i32> {
             | Commands::Env(crate::cli::EnvArgs {
                 command: EnvSubcommand::Import(_)
             })
-    ) {
+    );
+    let recovers = matches!(
+        &cli.command,
+        Commands::Op(crate::cli::OpArgs {
+            command: OpSubcommand::Recover(_)
+        })
+    );
+    let aborts = matches!(
+        &cli.command,
+        Commands::Tx(crate::cli::TxArgs {
+            command: TxSubcommand::Abort(_)
+        }) | Commands::Update(crate::cli::UpdateArgs {
+            command: UpdateSubcommand::Abort(_)
+        })
+    );
+    let _guard = if writes_production || recovers || aborts {
+        Some(crate::runtime_executor::try_lock_production(
+            &root.pid_file(),
+        )?)
+    } else {
+        None
+    };
+    if writes_production {
         crate::runtime_executor::ensure_prod_stopped(&root.pid_file())?;
+        if !matches!(
+            &cli.command,
+            Commands::Undo(_)
+                | Commands::Tx(crate::cli::TxArgs {
+                    command: TxSubcommand::Promote(_)
+                })
+                | Commands::Update(crate::cli::UpdateArgs {
+                    command: UpdateSubcommand::Promote(_)
+                })
+        ) {
+            crate::safety_guards::ensure_production_recoverable(&root)?;
+        }
     }
 
     match cli.command {

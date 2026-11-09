@@ -2,7 +2,6 @@ use std::io;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(not(target_os = "linux"))]
 use std::time::{Duration, Instant};
 
 use super::ProcessIdentity;
@@ -11,7 +10,12 @@ use super::ProcessIdentity;
 fn process_stat(pid: u32) -> io::Result<Option<(bool, u32, String)>> {
     let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None);
+        }
         Err(error) => return Err(error),
     };
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid /proc process stat");
@@ -239,6 +243,197 @@ pub fn candidate_is_alive(identity: &ProcessIdentity) -> anyhow::Result<bool> {
     #[cfg(not(target_os = "linux"))]
     identity.is_alive()
 }
+
+#[cfg(target_os = "linux")]
+mod production {
+    use super::*;
+    use anyhow::{Result, ensure};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::atomic::AtomicI32;
+
+    static STOP_SIGNAL: AtomicI32 = AtomicI32::new(0);
+    const GRACE: Duration = Duration::from_secs(30);
+    const FORCE: Duration = Duration::from_secs(5);
+    const POLL: Duration = Duration::from_millis(25);
+
+    pub fn install_supervisor_signals() -> io::Result<()> {
+        extern "C" fn request_stop(signal: libc::c_int) {
+            let _ = STOP_SIGNAL.compare_exchange(0, signal, Ordering::Relaxed, Ordering::Relaxed);
+        }
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            if unsafe { libc::signal(signal, request_stop as *const () as libc::sighandler_t) }
+                == libc::SIG_ERR
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn supervise_production(command: &mut Command) -> Result<i32> {
+        let group = std::process::id();
+        ensure!(
+            unsafe { libc::getpgrp() } == group as libc::pid_t,
+            "production launcher is not its process group leader"
+        );
+        let signal = STOP_SIGNAL.load(Ordering::Relaxed);
+        if signal != 0 {
+            return Ok(128 + signal);
+        }
+        let mut child = command.spawn()?;
+        let (status, signal) = loop {
+            let status = child.try_wait()?;
+            let signal = STOP_SIGNAL.load(Ordering::Relaxed);
+            if status.is_some() || signal != 0 {
+                break (status, signal);
+            }
+            std::thread::sleep(POLL);
+        };
+        if !group_members(group)?.is_empty() {
+            let signal = if signal == 0 { libc::SIGTERM } else { signal };
+            // The supervisor keeps the group ID reserved and handles this signal itself.
+            send_signal(-(group as libc::pid_t), signal)?;
+            let deadline = Instant::now() + GRACE;
+            while Instant::now() < deadline && !group_members(group)?.is_empty() {
+                std::thread::sleep(POLL);
+            }
+            let deadline = Instant::now() + FORCE;
+            loop {
+                let members = group_members(group)?;
+                if members.is_empty() {
+                    break;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "production process group did not exit"
+                );
+                for pid in members {
+                    signal_verified(pid, libc::SIGKILL, || {
+                        Ok(process_stat(pid)?
+                            .is_some_and(|(alive, pgid, _)| alive && pgid == group))
+                    })?;
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+        Ok(exit_code(match status {
+            Some(status) => status,
+            None => child.wait()?,
+        }))
+    }
+
+    pub fn production_group_alive(identity: &ProcessIdentity) -> Result<bool> {
+        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        if identity.creation.split_once(':').map(|(id, _)| id) != Some(boot.trim()) {
+            return Ok(false);
+        }
+        if let Some((alive, pgid, started)) = process_stat(identity.pid)? {
+            if identity.creation != format!("{}:{started}", boot.trim()) {
+                return Ok(false);
+            }
+            if alive {
+                ensure!(
+                    pgid == identity.pid,
+                    "recorded supervisor is not a process group leader"
+                );
+                return Ok(true);
+            }
+        }
+        Ok(!group_members(identity.pid)?.is_empty())
+    }
+
+    pub fn interrupt_supervisor(identity: &ProcessIdentity) -> io::Result<()> {
+        signal_supervisor(identity, libc::SIGINT).map(|_| ())
+    }
+
+    pub fn stop_supervised(identity: &ProcessIdentity, grace_seconds: u32) -> Result<()> {
+        if signal_supervisor(identity, libc::SIGTERM)? {
+            let deadline =
+                Instant::now() + Duration::from_secs(grace_seconds.into()) + FORCE + POLL * 4;
+            while Instant::now() < deadline && production_group_alive(identity)? {
+                std::thread::sleep(POLL);
+            }
+        }
+        ensure!(
+            !production_group_alive(identity)?,
+            "production process group is still active; verify the recorded supervisor and its group"
+        );
+        Ok(())
+    }
+
+    fn signal_supervisor(identity: &ProcessIdentity, signal: libc::c_int) -> io::Result<bool> {
+        signal_verified(identity.pid, signal, || {
+            Ok(
+                process_creation(identity.pid)?.as_ref() == Some(&identity.creation)
+                    && process_stat(identity.pid)?.is_some_and(|(_, pgid, _)| pgid == identity.pid),
+            )
+        })
+    }
+
+    fn signal_verified(
+        pid: u32,
+        signal: libc::c_int,
+        verify: impl FnOnce() -> io::Result<bool>,
+    ) -> io::Result<bool> {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            return missing_or_error();
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(fd as _) };
+        if !verify()? {
+            return Ok(false);
+        }
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        } < 0
+        {
+            return missing_or_error();
+        }
+        Ok(true)
+    }
+
+    fn missing_or_error() -> io::Result<bool> {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(false);
+        }
+        Err(error)
+    }
+
+    fn group_members(group: u32) -> io::Result<Vec<u32>> {
+        let mut members = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            if let Ok(pid) = entry?.file_name().to_string_lossy().parse()
+                && pid != group
+                && process_stat(pid)?.is_some_and(|(alive, pgid, _)| alive && pgid == group)
+            {
+                members.push(pid);
+            }
+        }
+        Ok(members)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn stale_supervisor_identity_is_not_signaled() {
+        let mut identity = ProcessIdentity::capture(std::process::id()).unwrap();
+        identity.creation.push('0');
+        assert!(!production_group_alive(&identity).unwrap());
+        assert!(!signal_supervisor(&identity, libc::SIGTERM).unwrap());
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use production::{
+    install_supervisor_signals, interrupt_supervisor, production_group_alive, stop_supervised,
+    supervise_production,
+};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 

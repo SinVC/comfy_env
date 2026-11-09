@@ -50,6 +50,7 @@ pub fn cmd_env_export(args: EnvExportArgs, root: &ProjectRoot) -> AppResult<()> 
 }
 
 fn env_export(args: EnvExportArgs, root: &ProjectRoot) -> Result<()> {
+    let _guard = crate::runtime_executor::try_lock_production(&root.pid_file())?;
     let (config, uv) = super::configured_uv(root)?;
     let comfy = configured_comfy(&config)?;
     ensure!(
@@ -95,9 +96,31 @@ fn env_export(args: EnvExportArgs, root: &ProjectRoot) -> Result<()> {
             "bundle output cannot be inside plugin source"
         );
     }
+    // Run the real export once, before creating the destination. In particular,
+    // old uv versions may support the project but lack this export format.
+    let exported = uv.export_pylock(root.as_path())?;
+    if !exported.success
+        && exported.stderr.contains("invalid value")
+        && exported.stderr.contains("pylock.toml")
+    {
+        bail!("uv does not support pylock.toml export; use a uv version that supports it");
+    }
+    ensure!(
+        exported.success,
+        "uv export failed: {}",
+        exported.summary_line()
+    );
     fs::create_dir(&args.output_dir)
         .with_context(|| format!("failed to create {}", args.output_dir.display()))?;
-    let result = export_into(&args.output_dir, root, &config, &uv, &sources, ids);
+    let result = export_into(
+        &args.output_dir,
+        root,
+        &config,
+        &uv,
+        &sources,
+        ids,
+        &exported.stdout,
+    );
     if let Err(error) = result {
         if let Err(cleanup) = fs_support::remove_tree(&args.output_dir) {
             bail!("export failed: {error:#}; cleanup failed: {cleanup:#}");
@@ -115,17 +138,12 @@ fn export_into(
     uv: &UvClient,
     sources: &[(String, PathBuf)],
     ids: BTreeSet<String>,
+    pylock: &str,
 ) -> Result<()> {
     fs_support::copy_file(&root.pyproject_toml(), &output.join("pyproject.toml"))?;
     dependency_sync::copy_lock(root.as_path(), output)?;
     fs_support::copy_file(&root.plugins_registry(), &output.join("state/plugins.json"))?;
-    let exported = uv.export_pylock(root.as_path())?;
-    ensure!(
-        exported.success,
-        "uv export failed: {}",
-        exported.summary_line()
-    );
-    fs_support::atomic_write(&output.join("pylock.toml"), exported.stdout.as_bytes())?;
+    fs_support::atomic_write(&output.join("pylock.toml"), pylock.as_bytes())?;
     for (id, source) in sources {
         fs_support::copy_tree(source, &output.join("custom_nodes").join(id), &[".git"])?;
     }
