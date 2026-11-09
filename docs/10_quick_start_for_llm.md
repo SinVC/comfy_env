@@ -45,7 +45,7 @@
 1. `./bin/gov update run [--requirements-file <path>] [--timeout <seconds>]`
 2. `./bin/gov update inspect <txid>`
 3. `./bin/gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]`
-4. `./bin/gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
+4. `./bin/gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run] [--keep-artifacts]`
 5. `./bin/gov update abort <txid>`
 
 ### 4.3 全局 Pin 管理
@@ -67,7 +67,7 @@
 1. `./bin/gov node add <git_url> [--id <node_id>]`
 2. `./bin/gov tx run <node_id>`
 3. `./bin/gov tx inspect <txid>`
-4. `./bin/gov tx promote <txid>`
+4. `./bin/gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run] [--keep-artifacts]`
 5. `./bin/gov resolve <txid>`
 
 ### 4.5 环境交付
@@ -103,6 +103,12 @@
 ./bin/gov update promote <txid>
 ```
 
+说明：
+
+1. `update run` 会过滤 `torch`、`torchvision`、`torchaudio`，并继续事务。
+2. candidate 运行到达 timeout 时会收束进程，但事务仍记为 `completed`，并保留真实 `run_exit_code`。
+3. 成功 `update promote` 后默认清理 candidate env 与 staged workdir；如需保留可传 `--keep-artifacts`。
+
 ### 5.3 全局兼容 Pin
 
 ```bash
@@ -127,6 +133,12 @@
 ./bin/gov tx run <node_id>
 ./bin/gov tx promote <txid>
 ```
+
+说明：
+
+1. `tx run` 的 candidate 输出会同时进入终端和 `state/logs/`。
+2. candidate 运行到达 timeout 时会收束进程，但事务仍记为 `completed`，并保留真实 `run_exit_code`。
+3. 成功 `tx promote` 后默认清理 candidate env 与 staged workdir；如需保留可传 `--keep-artifacts`。
 
 ### 5.6 环境交付
 

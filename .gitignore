@@ -5,11 +5,16 @@
 .agents/
 .gemini/
 .cluade/
+target/
 .venv-prod/                
 .venv-candidate/ 
 config.toml
 pyproject.toml
 uv.lock
+
+# Python cache
+__pycache__/
+*.py[cod]
 
 # local runtime directories
 cache/
@@ -24,3 +29,4 @@ state/work/
 state/plugins.json
 state/snapshots_index.json
 state/comfyui.pid
+state/comfyui.pid.lock

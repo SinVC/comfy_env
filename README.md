@@ -1,161 +1,152 @@
-# Comfy Environment Governance (`comfy_env`)
+# Comfy Environment Governance (`gov`)
 
-ComfyUI 依赖治理系统。
-完全切换到切换到的高速UV并且具备更好缓存策略的依赖管理，同时并且不破坏项目本体pyptoject.toml避免每次git时候的合并操作。支持本体和插件的依赖事务管理，可以精确回滚，保证不炸环境。放心升级和折腾，
-现在同时覆盖两类依赖面：
+<p align="center">
+  <b>Deterministic, transactional, and agent-native sidecar dependency governance for ComfyUI.</b>
+</p>
 
-1. 插件依赖：继续使用 `tx run -> tx promote -> undo`
-2. ComfyUI 本地核心依赖：使用 `init -> install torch -> install` 完成首装，后续使用 `update run -> update promote -> undo`
+<p align="center">
+  <a href="README.md"><b>English</b></a> •
+  <a href="README.zh-CN.md"><b>简体中文</b></a>
+</p>
 
-面向AI使用和coding优化。
+<p align="center">
+  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-blue.svg" alt="Platform: Linux | Windows" />
+  <img src="https://img.shields.io/badge/Rust-Single%20Binary-orange.svg" alt="Rust" />
+  <img src="https://img.shields.io/badge/Engine-uv-purple.svg" alt="uv" />
+  <img src="https://img.shields.io/badge/Safety-Transactional%20Rollback-green.svg" alt="Safety" />
+</p>
 
-## 0. 如果你是 AI
+---
 
-1. 开发或审计时，阅读 `dev-docs/architecture-haiku.md`，把它当作唯一入口导航。
-2. 使用时，阅读：`docs/04_cli_reference.md`
-## 1. 项目目标
+## Overview
 
-1. 可复现：本地 `pyproject.toml + uv.lock` 可重建依赖环境。
-2. 可审计：插件事务、核心依赖升级、操作备份都有状态与日志。
-3. 可恢复：`install/promote/remove/update promote` 失败自动回退；成功操作可 `undo`。
-4. 可治理：核心包变更需要显式批准。
+### The Problem: Custom-Node Dependency Chaos
+Anyone running ComfyUI has experienced the nightmare: installing custom nodes often triggers arbitrary `pip install` commands that silently clobber PyTorch/CUDA builds, downgrade critical libraries, or inject conflicting dependencies. Once the Python virtual environment breaks, diagnosing root causes is difficult, uninstallation leaves toxic package residue, and recovery typically requires wiping and reinstalling the entire environment from scratch.
 
-## 2. 命令总览
+### The Solution: Sidecar Transactional Governance
+`comfy_env` introduces **`gov`**, a high-reliability sidecar governance engine written in Rust. Powered by Astral's [`uv`](https://github.com/astral-sh/uv), `gov` isolates, stages, audits, and locks dependency changes:
+- **Sandbox Observation**: Custom node dependencies are staged and verified in an isolated candidate environment (`.venv-candidate`) before touching production (`.venv-prod`).
+- **Verifiable Rollbacks**: Every mutating operation creates a pre-operation cryptographic snapshot, allowing instant and deterministic rollbacks via `gov undo`.
+- **Core Drift Protection**: Custom nodes cannot silently alter PyTorch or ComfyUI core dependencies without explicit policy approval (`--approve-core`).
 
-1. `./bin/gov init --comfyui-dir <abs-path> --python <python-spec>`
-2. `./bin/gov install torch --index-url <url>`
-3. `./bin/gov install [--requirements-file <path>]`
-4. `./bin/gov update run [--requirements-file <path>] [--timeout <seconds>]`
-5. `./bin/gov update inspect <txid>`
-6. `./bin/gov update resolve <txid> [--pin <pkg==version>]... [--pins-file <path>]`
-7. `./bin/gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
-8. `./bin/gov update abort <txid>`
-9. `./bin/gov env export <output_tar>`
-10. `./bin/gov env import <bundle_tar> --comfyui-dir <abs-path> --python <python-spec>`
-11. `./bin/gov status`
-12. `./bin/gov node add <git_url> [--ref <sha/tag>] [--id <node_id>]`
-13. `./bin/gov node remove <node_id> [--purge-code]`
-14. `./bin/gov tx run <node_id> [--timeout <seconds>]`
-15. `./bin/gov tx inspect <txid>`
-16. `./bin/gov tx abort <txid>`
-17. `./bin/gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
-18. `./bin/gov resolve <txid>`
-19. `./bin/gov op list`
-20. `./bin/gov op inspect <op_id>`
-21. `./bin/gov undo <op_id>`
-22. `./bin/gov run [--sync] [-- <args...>]`
-23. `./bin/gov stop`
+### Why a CLI? Built for Autonomous AI Agents
+Modern generative AI workflows increasingly rely on autonomous AI agents (such as Claude Code, AutoGPT, or IDE coding assistants) to install nodes, configure workflows, and orchestrate environments. GUIs and interactive prompts are notoriously brittle and stall automated agent loops.
 
-## 3. 目录结构（侧车模式）
+`gov` is designed **agent-first**:
+- **Deterministic & Scriptable**: Structured CLI flags, predictable exit codes, and non-interactive workflows provide seamless automation without prompt traps.
+- **Machine-Inspectable State**: All transactions, operations, and lock conflicts produce structured JSON and lockfile artifacts (`state/transactions/`, `state/conflicts/`) that agents can easily parse and reason about.
+- **Autonomous Self-Healing**: When dependency conflicts emerge, agents can inspect the conflict reports, programmatically resolve pins via `gov resolve`, or instantly roll back failing operations via `gov undo`.
+
+---
+
+## Architecture at a Glance
+
+`comfy_env` runs alongside your ComfyUI installation using a clean **sidecar model**, leaving upstream ComfyUI untouched:
 
 ```text
-TopDir/
-├── ComfyUI/
+Workspace/
+├── ComfyUI/              # Upstream ComfyUI (unpolluted code repository)
 │   ├── main.py
 │   ├── requirements.txt
-│   └── custom_nodes/
-└── comfy_env/
-    ├── bin/gov
-    ├── config.toml.template
-    ├── pyproject.toml.template
-    ├── config.toml
-    ├── pyproject.toml
-    ├── uv.lock
-    ├── .venv-prod/
-    ├── .venv-candidate/
-    ├── state/
-    │   ├── plugins.json
-    │   ├── ops/
-    │   ├── transactions/
-    │   ├── conflicts/
-    │   ├── logs/
-    │   └── work/
-    ├── dev-docs/
-    └── docs/
+│   └── custom_nodes/     # Managed custom node installations
+│
+└── comfy_env/            # Sidecar Governance Directory
+    ├── gov / gov.exe     # Standalone Rust binary (sole entry point)
+    ├── config.toml       # Local path & Python runtime configuration
+    ├── pyproject.toml    # Declarative dependency groups (uv)
+    ├── uv.lock           # Locked, reproducible dependency tree
+    ├── .venv-prod/       # Production Python virtual environment
+    ├── .venv-candidate/  # Isolated sandbox for candidate transactions
+    └── state/            # Transaction ledgers, operation backups & conflict logs
 ```
 
-## 4. 首次安装（新顺序）
+---
+
+## Quick Start
+
+### 1. Initialize & Bootstrap
+Initialize the governance configuration, bind to Python, and configure PyTorch and core requirements:
 
 ```bash
-./bin/gov init --comfyui-dir /abs/path/to/ComfyUI --python 3.12
-./bin/gov install torch --index-url https://download.pytorch.org/whl/cu130
-./bin/gov install
+# 1. Initialize configuration and production environment
+gov init --comfyui-dir /path/to/ComfyUI --python 3.12
+
+# 2. Install and pin PyTorch with matching CUDA/CPU index
+gov install torch --index-url https://download.pytorch.org/whl/cu124
+
+# 3. Import baseline ComfyUI requirements into dependency-groups.core
+gov install
 ```
 
-说明：
-
-1. `init` 负责写入 `config.toml` 的 `paths.comfyui_dir` 与 `runtime.python`，并初始化最小 prod 环境；若 `--python` 传入纯 `major.minor`（如 `3.12`）则直接采用该 minor 线，若传入 patch 版本或解释器选择器（如 `3.12.8`、`python3.12`）则先用 `uv python find --no-python-downloads` 解析到本机可执行解释器，再回写成 minor 线。
-2. `install torch` 把 `torch/torchvision/torchaudio` 收敛到 `dependency-groups.torch`，并记录可撤销的 operation。
-3. `install` 从 `${comfyui_dir}/requirements.txt` 导入基础依赖到 `dependency-groups.core`。
-4. `install` 在 torch 未先安装时会阻断。
-
-## 5. 后续升级（核心依赖事务）
+### 2. The Hero Flow: Safe Custom Node Installation
+Never run unmanaged `pip install` again. Safely stage, observe, and promote node changes:
 
 ```bash
-./bin/gov update run
-./bin/gov update inspect <txid>
-./bin/gov update resolve <txid> --pin pkg==1.2.3
-./bin/gov update promote <txid>
+# 1. Register and clone custom node
+gov node add https://github.com/example/custom-node.git
+
+# 2. Run candidate transaction in sandbox (.venv-candidate)
+gov tx run custom-node
+
+# 3. Inspect proposed lock diff and dependency impacts
+gov tx inspect <txid>
+
+# 4. Promote safely into production (.venv-prod)
+gov tx promote <txid>
 ```
 
-说明：
+*If dependency conflicts occur, inspect the conflict report and resolve via `gov resolve <txid>` before promotion.*
 
-1. `update run` 读取 `requirements.txt`，在 staged workdir 构造候选真相，再同步到 candidate 环境观察。
-2. `update promote` 只晋升该事务已经固定下来的 staged snapshot，不会重新读取当前 `requirements.txt`。
-3. promote 失败会回滚，成功的 `update_promote` operation 可用 `undo` 撤销。
-
-## 6. 插件事务（保持不变）
+### 3. Inspection & Instant Rollback
+Audit system health or roll back any change safely:
 
 ```bash
-./bin/gov node add <git_url> [--id <node_id>]
-./bin/gov tx run <node_id>
-./bin/gov tx inspect <txid>
-./bin/gov tx promote <txid>
+# View comprehensive system status & health
+gov status
+
+# List mutation operations
+gov op list
+
+# Roll back any mutation using its pre-op snapshot
+gov undo <op_id>
 ```
 
-冲突时：
+---
+
+## Documentation Navigation
+
+The repository contains extensive, detailed specifications and implementation guides. Follow the links below for deep dives:
+
+| Topic | Document Link | Description |
+| :--- | :--- | :--- |
+| **System Architecture** | [Architecture Overview](dev-docs/architecture.md) ([中文版](dev-docs/architecture.zh-CN.md)) | System invariants, module boundaries, and cross-platform design |
+| **Design Objectives** | [Project Objectives](docs/01_project_objectives.md) | Problem analysis, design philosophy, and success metrics |
+| **Agent / LLM Guide** | [Quick Start for LLMs & Agents](docs/10_quick_start_for_llm.md) | Mental models, command quick-reference, and agent execution recipes |
+| **Command Contracts** | [Command Contracts Index](dev-docs/commands/contracts.md) | Exhaustive behavioral specifications for every CLI command |
+| **CLI Reference** | [CLI Reference Manual](docs/04_cli_reference.md) | Complete CLI options, flags, and parameter reference |
+| **Node Management** | [Node Commands](dev-docs/commands/node.md) & [Tx Commands](dev-docs/commands/tx.md) | Node lifecycle and candidate transaction management |
+| **Core Updates** | [Update Commands](dev-docs/commands/update.md) | Staging and promoting ComfyUI core dependency upgrades |
+| **Dependency Overrides** | [Pin Governance](docs/12_gov_pin_handoff.md) | Global package pins and version override management (`gov pin`) |
+| **Runtime & Operations** | [Runtime & Operations Guide](docs/03_runtime_and_operations.md) | Production locking, process supervision (`gov run`), and recovery |
+| **Environment Portability** | [Export & Import Handoff](docs/11_env_export_import_handoff.md) | Exporting and importing reproducible environment bundles (`gov env`) |
+
+---
+
+## Building from Source
+
+`gov` is written in Rust and compiles to a single native binary on both Linux and Windows:
 
 ```bash
-./bin/gov resolve <txid>
-./bin/gov tx promote <txid>
+# Build release binary
+cargo build --release
+
+# Output binary location:
+# Linux:   target/release/gov
+# Windows: target/release/gov.exe
 ```
 
-## 7. 撤销与状态
+---
 
-```bash
-./bin/gov status
-./bin/gov op list
-./bin/gov undo <op_id>
-```
+## License
 
-`status` 现在会额外显示：
-
-1. `config_ready`
-2. `comfyui_dir`
-3. `python`
-4. `torch_ready`
-5. `core_ready`
-6. `update_transactions_pending`
-
-## 8. 环境交付
-
-```bash
-./bin/gov env export /abs/path/to/bundle.tar
-./bin/gov env import /abs/path/to/bundle.tar --comfyui-dir /abs/path/to/ComfyUI --python 3.12
-```
-
-说明：
-
-1. `env export` 导出单文件 `.tar` bundle，tar 内部固定包含 `bundle/pyproject.toml`、`bundle/uv.lock`、`bundle/pylock.toml`、`bundle/state/plugins.json`、过滤 Git 元数据后的 `bundle/custom_nodes/*` 运行时源码快照和审计文件；快照保留工作树中的已修改文件和未跟踪文件。
-2. `env import` 只接受 `.tar` bundle，不支持目录 bundle 或 tarball 以外的输入。
-3. `env import --python` 和 `init --python` 采用同一套规则：纯 `major.minor` 直接使用，其他 selector 先解析到目标机已安装解释器，再规范化为 minor 线。
-4. `comfyui_dir` 是目标机本地配置，不属于 bundle 真相；导入时必须显式传入。
-5. 导入后的本地依赖真相仍然是 `pyproject.toml + uv.lock`；`pylock.toml` 是标准化交付物，不替代本地真相。
-6. `env import` 默认执行精确恢复：覆盖目标 root truth、prod env、插件注册，并清理 bundle 外的 `custom_nodes/*` 目录，使结果与 bundle 一致。
-7. v1 不支持 partial import、nodes-only import 或按节点依赖增量导入。
-
-## 9. 文档导航
-
-1. `dev-docs/architecture-haiku.md`
-2. `docs/04_cli_reference.md`
-3. `docs/10_quick_start_for_llm.md`
+This project is licensed under the Apache 2.0 / MIT Dual License.

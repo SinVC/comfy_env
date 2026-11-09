@@ -1,0 +1,31 @@
+[package]
+name = "gov"
+version = "0.1.0"
+edition = "2024"
+description = "Governance CLI for ComfyUI dependency transactions"
+
+[[bin]]
+name = "gov"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.39", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+getrandom = "0.4"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+sha2 = "0.10.9"
+tempfile = "3.20.0"
+thiserror = "2.0.17"
+toml_edit = { version = "0.22.27", features = ["serde"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[dev-dependencies]
+assert_cmd = "2.0.17"
+predicates = "3.1.3"

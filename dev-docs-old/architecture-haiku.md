@@ -135,6 +135,8 @@
   - Promote: applying transaction-derived dependency changes to local truth and `.venv-prod`.
 - ADR Index:
   - [ADR-001 Global Pin Management via `dependency-groups.overrides`](./adr/001-global-pin-management.md)
+  - [ADR-002 重写语言选择讨论稿](./adr/002-rewrite-language-selection.md)
+  - [ADR-003 Rust 重写方案](./adr/003-rust-rewrite-plan.md)
 - Open Questions:
   - The codebase is a single shell entrypoint; future extraction into separate scripts may require re-drawing module boundaries from logical to physical modules.
   - Plugin `resolve` still uses interactive stdin while `update resolve` is parameterized; the long-term convergence path is still open.

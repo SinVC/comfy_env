@@ -2,66 +2,111 @@
 
 ## Project Overview
 
-`comfy_env` is a sidecar governance CLI for ComfyUI custom-node dependency changes. Optimize for correctness, auditability, and rollback safety over speed; a broken venv is worse than a slow command. All production dependency mutations must go through a candidate transaction before promotion.
+`comfy_env` is a sidecar governance CLI for ComfyUI custom-node dependency changes. Optimize for correctness, auditability, and rollback safety over speed; a broken venv is worse than a slow command. Stage and lock dependency changes before promotion. Plugin and core update transactions also observe a candidate environment.
+
+The CLI is implemented in **Rust** as a single binary `gov`. Target platforms: **Linux + Windows**.
 
 ## Tech Stack
 
-- Linux-only runtime and test environment
-- Bash entrypoint: `bin/gov` with `set -euo pipefail`
-- Inline Python heredocs for TOML/JSON parsing
-- `uv` for lock/sync/add/remove/freeze
-- `git` for plugin clone/checkout
-- Local truth: `config.toml`, `pyproject.toml`, `uv.lock`
-- Durable state: `state/*.json`, `state/transactions/*.json`
+- **Language**: Rust (single crate, single binary)
+- **CLI**: `clap` with derive macros
+- **TOML editing**: `toml_edit` (format-preserving)
+- **JSON state**: `serde` + `serde_json`
+- **Error handling**: `anyhow` at command layer; typed boundaries on critical mutation paths
+- **External tools** (subprocess calls, not embedded): `uv`, `git`, Python
+- **Local truth files**: `config.toml`, `pyproject.toml`, `uv.lock`
+- **Durable state**: `state/*.json`, `state/transactions/*.json`, `state/ops/*`
 
 ## Commands
 
-- Test: `bash tests/test_gov_cli.sh`
-- Help: `bin/gov help`
-- Status: `bin/gov status`
-- Hero flow: `bin/gov node add <url>` → `bin/gov tx run` → `bin/gov tx inspect` → `bin/gov tx promote`
+- Build: `cargo build --release`
+- Test: `cargo test`
+- Test (legacy Linux behavioral baseline): `bash tests/test_gov_cli.sh`
+- Help: `gov help`
+- Status: `gov status`
+- Hero flow: `gov node add <url>` → `gov tx run` → `gov tx inspect` → `gov tx promote`
 
 ## Architecture
 
-- `bin/gov` is the only entrypoint; command dispatch and subsystem orchestration stay there unless `dev-docs/conventions/code-map.md` changes too.
+- `gov` (Rust binary) is the **sole entry point**. No Bash wrapper, dispatcher, or shim.
 - `pyproject.toml` + `uv.lock` are the dependency source of truth; `state/plugins.json` is registry metadata, not dependency truth.
 - Candidate transactions are the only supported way to observe dependency impact before promotion into `.venv-prod`.
-- `dev-docs/` is the canonical design set; if `docs/` conflicts, follow `dev-docs/` and code.
+- Development entry point: start from `dev-docs/architecture.md`, then follow the relevant command and module docs from there.
+- Treat `dev-docs/architecture.md` as the authoritative navigation entry for implementation work; `AGENTS.md` is only the quick project brief and constraint summary.
 
 ## Coding Conventions
 
-- Implement commands as `cmd_<name>()` functions dispatched from the `main()` case block.
-- Keep helpers grouped by subsystem: state ledger, dependency sync, source integration, safety guards, runtime executor.
-- Use minimal inline Python via `<<'PY'`; prefer small targeted snippets over Bash re-implementations of TOML/JSON logic.
-- Use local variables inside functions; do not introduce mutable globals beyond declared `*_DIR` / `*_FILE` constants.
-- Normalize dependency group names through `normalize_group_name()`.
-- Guard external tools with `require_cmd` / `require_python` before use.
+- One module per subsystem under `src/`: `application/`, `domain/`, `state_ledger/`, `safety_guards/`, `dependency_sync/`, `source_integration/`, `runtime_executor/`, `platform/`, `toml_support/`, `fs_support/`.
+- Command implementations live in `src/application/<command>.rs`.
+- Use newtypes for IDs: `TxId`, `OpId`, `NodeId`, `GroupName`.
+- Use enums for state: `TxStatus`, `OpStatus`, `RunOutcome` — never bare strings.
+- Error handling: `anyhow::Result` at command layer; typed return values on critical mutation paths that indicate whether side effects occurred and whether restore is needed.
+- External tools (`uv`, `git`, `python`) wrapped in client structs returning `CmdResult`. Never call `Command::new()` directly from application code.
+- TOML editing via `toml_edit` — modify only the target node, do not reformat the file.
+- File writes: temp file → fsync → atomic rename. Never "delete then record".
+- No hardcoded `bin/python` — use venv Python locator from `platform/`.
+- Paths in state files use forward slashes regardless of platform.
 
 ## Boundaries
 
-- Treat this as a Linux-only project; do not add Windows-specific logic, instructions, or validation paths unless the project scope changes.
-- Check current `uv` capabilities before inventing custom dependency-management logic.
+- Target platforms: Linux + Windows. macOS is not actively tested but should work where possible.
+- Do not embed `uv`, `git`, or Python as libraries. Keep them as external CLI dependencies.
 - Never edit `*.template`, `state/*`, `.venv-prod/`, or `.venv-candidate/` by hand; use the existing ledger and sync flows.
-- Do not add external tool dependencies beyond `uv`, `git`, and Python.
 - Do not bypass transaction, backup, or promote safety paths for prod-affecting changes.
+- State file schema changes: append-only optional fields, no renames, read path tolerant of missing optional fields.
+- No Unix-specific runtime dependencies. The binary must not shell out to bash, coreutils, or any Unix-only commands.
+- Bundle cross-platform import is rejected in v1 (platform mismatch → error).
 
 ## Verification
 
-- Run `bash tests/test_gov_cli.sh` before considering work complete.
-- For new commands, exercise one happy path and one failure path manually.
+- Run `cargo test` before considering work complete.
+- Run `cargo test` on **both Linux and Windows** for cross-platform work.
+- Run `bash tests/test_gov_cli.sh` on Linux to verify behavioral compatibility (legacy baseline only, not cross-platform oracle).
+- For new commands, exercise one happy path and one failure path on both platforms.
 - For dependency-mutation changes, verify real `uv lock` and `uv sync` behavior in a project layout.
 - For remove/promote/undo changes, verify backup and restore behavior rather than relying on code inspection alone.
+
+## Sandbox Notes
+
+Use this section to record commands that should be run with escalation immediately in this workspace, without first attempting a non-escalated run.
+
+- `git add` — direct escalation required; sandboxed execution consistently fails with Git index lock or permission errors.
+- `git commit` — direct escalation required; sandboxed execution consistently fails with Git index lock or permission errors.
+
+## Migration Status
+
+Vertical slice migration — each slice delivers a complete command group:
+
+- [x] Slice 1 (implemented): `pin add` / `pin list` / `pin remove` / `undo` / `op list` / `op inspect`
+- [x] Slice 2 (implemented): `install torch` / `install` / `status`
+- [x] Slice 3: `node add` / `node remove` / `tx run` / `tx inspect` / `tx abort` / `tx promote` / `resolve`
+- [x] Slice 4: `update run` / `update inspect` / `update abort` / `update promote` / `update resolve`
+- [x] Slice 5: `env export` / `env import`
+- [x] Slice 6: `run` / `stop` / `help` / `init`
 
 ## Read Only When Needed
 
 Do not read every document listed below by default. Read only the document(s) that match the current task.
 
-- If you are changing CLI commands or command dispatch, read `dev-docs/application-core/spec.md` and `dev-docs/conventions/code-map.md`.
-- If the task touches transaction records, conflict artifacts, or undo metadata, read `dev-docs/subsystems/state-ledger/spec.md`.
-- If the task touches `tx promote`, `node remove`, `undo`, backups, or rollback behavior, read `dev-docs/subsystems/safety-guards/spec.md` and `dev-docs/policies/rollback-safety.md`.
-- If the task changes dependency resolution, lockfiles, sync behavior, or `uv` flows, read `dev-docs/subsystems/dependency-sync/spec.md`.
-- If the task changes plugin clone/checkout or source snapshot behavior, read `dev-docs/subsystems/source-integration/spec.md`.
-- If the task changes runtime launch, stop, timeout, PID, or logs, read `dev-docs/subsystems/runtime-executor/spec.md`.
-- If the task touches core-package approvals or override pin design, read `dev-docs/policies/core-impact-gate.md` and `dev-docs/adr/001-global-pin-management.md`.
-- If the task changes environment export/import behavior, read `dev-docs/application-core/spec.md` for `UC-010` and `core#KF-011`.
-- Only read `dev-docs/architecture-haiku.md` when the task spans multiple subsystems or requires repo-wide invariants first.
+Recommended read order for implementation work:
+
+1. Start with `dev-docs/architecture.md`.
+2. Read the relevant file in `dev-docs/commands/`.
+3. Read only the specific file(s) in `dev-docs/modules/` that the command actually depends on.
+4. Follow the implementation links in those docs into `src/`.
+
+**System-level design:**
+- For system overview, invariants, module map, and cross-platform rules: read `dev-docs/architecture.md`.
+- For the rewrite plan and migration strategy: read `dev-docs/adr/003-rust-rewrite-plan.md`.
+
+**Command behavioral contracts (what each command does step-by-step):**
+- For the command index and shared protocol reference: read `dev-docs/commands/contracts.md`.
+- For a specific command group: read the corresponding file in `dev-docs/commands/` (e.g., `pin.md`, `tx.md`, `env.md`).
+
+**Module specs (how each building block works internally):**
+- For command orchestration patterns and standard handler skeleton: read `dev-docs/modules/application.md`.
+- For a specific module: read the corresponding file in `dev-docs/modules/` (e.g., `platform.md`, `safety-guards.md`, `dependency-sync.md`).
+
+Legacy reference: read only when current docs and current Rust code are still insufficient to answer the question or recover intended behavior.
+- Archived Bash-era design docs: `dev-docs-old\architecture-haiku.md`. This is not active design authority.
+- Use old docs only to understand legacy behavior or old implementation intent, not to override `dev-docs/architecture.md`, `dev-docs/commands/`, or `dev-docs/modules/`.

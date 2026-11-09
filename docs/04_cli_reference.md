@@ -1,6 +1,6 @@
 # 04 CLI 命令参考
 
-> 以下为 `comfy_env/bin/gov` 当前实现语义（Batch-4）。
+> 本文记录 Bash 版 `bin/gov` 的命令行为（Batch-4）。Rust 分支的可用命令见 [README](../README.md)，pin、审计及撤销的当前契约见 [pin](../dev-docs/commands/pin.md) 和 [ops](../dev-docs/commands/ops.md)。
 
 ## 1. 首装与核心依赖
 
@@ -82,6 +82,12 @@
 
 用途：为核心依赖升级创建独立事务，写入 `kind=core_update` 记录。
 
+关键行为：
+
+1. 会过滤 `torch`、`torchvision`、`torchaudio`，并继续事务；torch-family 本身不是 `update run` 的失败原因。
+2. candidate 运行是有界观察：到达 timeout 后会收束进程，但事务仍应记为 `completed`，同时保留真实 `run_exit_code`。
+3. candidate 的 stdout/stderr 会同时输出到终端和 `state/logs/`。
+
 ### `gov update inspect <txid>`
 
 用途：查看核心依赖升级事务摘要，包括 requirements 来源、staged workdir、diff、冲突和日志。
@@ -90,9 +96,9 @@
 
 用途：用参数化 pin 修复 `update run` 或 `update promote` 的 lock 冲突。
 
-### `gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
+### `gov update promote <txid> [--approve-core --reason "..."] [--allow-failed-run] [--keep-artifacts]`
 
-用途：把核心依赖升级事务的 staged snapshot 晋升到 prod。
+用途：把核心依赖升级事务的 staged snapshot 晋升到 prod；成功后默认清理 candidate env 与 staged workdir，传 `--keep-artifacts` 可保留。
 
 ### `gov update abort <txid>`
 
@@ -112,17 +118,22 @@
 
 用途：在 candidate 环境运行 ComfyUI 并记录插件事务。
 
+关键行为：
+
+1. candidate 运行是有界观察：到达 timeout 后会收束进程，但事务仍应记为 `completed`，同时保留真实 `run_exit_code`。
+2. candidate 的 stdout/stderr 会同时输出到终端和 `state/logs/`。
+
 ### `gov tx inspect <txid>`
 
 用途：查看插件事务摘要。
 
 ### `gov tx abort <txid>`
 
-用途：删除插件事务 candidate env 并标记为 `aborted`。
+用途：删除插件事务的 candidate env 与 staged workdir，并标记为 `aborted`。
 
-### `gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run]`
+### `gov tx promote <txid> [--approve-core --reason "..."] [--allow-failed-run] [--keep-artifacts]`
 
-用途：把插件事务晋升到 prod。
+用途：把插件事务晋升到 prod；成功后默认清理 candidate env 与 staged workdir，传 `--keep-artifacts` 可保留。
 
 ### `gov resolve <txid>`
 

@@ -1,5 +1,7 @@
 # 12 Gov Pin Notes
 
+本文记录 Bash 版的 uv 命令与实现锚点。Rust 版在暂存目录一次编辑 overrides 数组，再调用 uv 锁定。当前流程见 [pin 命令契约](../dev-docs/commands/pin.md)。
+
 ## 1. 目标
 
 `gov pin` 提供独立于事务冲突解决流程的全局精确版本 pin 管理能力。它允许用户直接维护共享的 `dependency-groups.overrides`，从而影响：

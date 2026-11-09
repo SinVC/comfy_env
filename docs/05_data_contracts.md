@@ -46,7 +46,7 @@
 `state/transactions/<txid>.json` 核心字段：
 
 1. 基础：`txid`, `node_id`, `started_at`, `ended_at`, `status`
-2. 环境：`candidate_env`
+2. 环境：`candidate_env`, `staged_workdir`
 3. 差异：`pre_freeze`, `post_freeze`, `diff.added`, `diff.removed`, `core_impact`
 4. 日志：`logs.stdout`, `logs.stderr`, `logs.run_exit_code`
 5. 冲突与晋升：`conflict_report`, `resolution_pins`, `promotion_plan`, `promotion`
@@ -58,6 +58,11 @@
 3. `op_id`
 4. `pre_op_id`
 5. `error`
+
+语义约束：
+
+1. `candidate_env` 与 `staged_workdir` 记录原始 artifact 路径，即使成功 `promote` 或 `abort` 后目录已被清理，也不会从事务 JSON 中抹除。
+2. inspect 层应根据文件系统实际存在性，把缺失路径显示为 `(cleaned)` 或 `(missing)`，但不改写 JSON。
 
 ## 4. Operation 元数据结构
 
@@ -95,11 +100,12 @@
 
 常见流转：
 
-1. `running -> completed|failed`
-2. `completed -> promoted|needs_resolution`
-3. `failed -> promote_failed|needs_resolution`（需 `--allow-failed-run`）
-4. `needs_resolution -> resolved|needs_resolution`
-5. `resolved -> promoted|needs_resolution`
+1. `running -> completed|failed|needs_resolution`
+2. `running -> completed` 既包括进程自然退出 0，也包括达到观察 timeout 后被系统收束。
+3. `completed -> promoted|needs_resolution|aborted`
+4. `failed -> promoted|promote_failed|needs_resolution|aborted`（promote 需 `--allow-failed-run`）
+5. `needs_resolution -> resolved|needs_resolution|aborted`
+6. `resolved -> promoted|needs_resolution|promote_failed`
 
 ## 6. 向后兼容规则
 
