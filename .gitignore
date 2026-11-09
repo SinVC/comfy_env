@@ -12,6 +12,10 @@ config.toml
 pyproject.toml
 uv.lock
 
+# Python cache
+__pycache__/
+*.py[cod]
+
 # local runtime directories
 cache/
 snapshots/
