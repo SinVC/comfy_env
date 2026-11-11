@@ -123,7 +123,7 @@ The repository contains extensive, detailed specifications and implementation gu
 | **Design Objectives** | [Project Objectives](docs/01_project_objectives.md) | Problem analysis, design philosophy, and success metrics |
 | **Agent / LLM Guide** | [Quick Start for LLMs & Agents](docs/10_quick_start_for_llm.md) | Mental models, command quick-reference, and agent execution recipes |
 | **Command Contracts** | [Command Contracts Index](dev-docs/commands/contracts.md) | Exhaustive behavioral specifications for every CLI command |
-| **CLI Reference** | [CLI Reference Manual](docs/04_cli_reference.md) | Complete CLI options, flags, and parameter reference |
+| **CLI Reference** | [CLI Reference Manual](docs/cli-reference.md) ([中文版](docs/cli-reference.zh-CN.md)) | Complete CLI options, flags, and parameter reference |
 | **Node Management** | [Node Commands](dev-docs/commands/node.md) & [Tx Commands](dev-docs/commands/tx.md) | Node lifecycle and candidate transaction management |
 | **Core Updates** | [Update Commands](dev-docs/commands/update.md) | Staging and promoting ComfyUI core dependency upgrades |
 | **Dependency Overrides** | [Pin Governance](docs/12_gov_pin_handoff.md) | Global package pins and version override management (`gov pin`) |

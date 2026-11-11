@@ -1,6 +1,8 @@
-# 04 CLI 命令参考
+# [DEPRECATED] 04 CLI 命令参考
 
-> 本文记录 Bash 版 `bin/gov` 的命令行为（Batch-4）。Rust 分支的可用命令见 [README](../README.md)，pin、审计及撤销的当前契约见 [pin](../dev-docs/commands/pin.md) 和 [ops](../dev-docs/commands/ops.md)。
+> **已废弃 / DEPRECATED**：本文记录的是早期 Bash 版 `bin/gov`（Batch-4）命令行为，已不再适用于当前 Rust 版 `gov`。请改阅新版独立手册：[docs/cli-reference.md](../cli-reference.md)（[简体中文版](../cli-reference.zh-CN.md)）。
+
+<!-- 原文保留用于历史参考 -->
 
 ## 1. 首装与核心依赖
 

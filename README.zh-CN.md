@@ -123,7 +123,7 @@ gov undo <op_id>
 | **项目目标** | [项目目标与原则](docs/01_project_objectives.md) | 核心痛点分析、设计原则与成功验收标准 |
 | **AI Agent 指南** | [LLM / Agent 快速上手指南](docs/10_quick_start_for_llm.md) | 心智模型、命令速查表与 Agent 自动化落地策略 |
 | **命令契约** | [命令契约总览](dev-docs/commands/contracts.md) | 所有 CLI 命令的输入输出契约与执行步骤 |
-| **CLI 手册** | [CLI 参考手册](docs/04_cli_reference.md) | 完整的命令参数、选项与行为规范 |
+| **CLI 手册** | [CLI 参考手册](docs/cli-reference.zh-CN.md) ([英文版](docs/cli-reference.md)) | 完整的命令参数、选项与行为规范 |
 | **节点生命周期** | [节点命令](dev-docs/commands/node.md) 与 [事务命令](dev-docs/commands/tx.md) | 节点增删与候选环境事务执行管理 |
 | **核心依赖升级** | [Update 升级命令](dev-docs/commands/update.md) | ComfyUI 核心依赖升级的沙盒演进与晋升机制 |
 | **依赖锁定 Pin** | [Pin 全局治理](docs/12_gov_pin_handoff.md) | 全局包版本精确锁定与冲突覆盖管理 (`gov pin`) |
