@@ -19,6 +19,14 @@ blocks startup. Record the launcher PID and host creation identity in
 wait. On exit, reacquire the lock and remove the matching record after the
 managed group or job has emptied. Output goes to the terminal.
 
+## `gov verify [--cpu]`
+
+Hold the production lock during a bounded check using the managed interpreter
+and ComfyUI's native quick-test entry point. Custom nodes are disabled for
+this check. Honor configured CPU mode. Exit zero when the native check
+completes and three when the checkout lacks the supported native probe.
+Preserve logs for probe failures.
+
 ## `gov stop`
 
 Read the process record under the same lock. Missing records and identities

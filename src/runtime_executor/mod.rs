@@ -213,6 +213,24 @@ pub fn runtime_status(path: &Path) -> Result<Option<(u32, bool)>> {
         .transpose()
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeState {
+    Stopped,
+    Running,
+    Unverified,
+}
+
+pub fn verified_runtime_state(path: &Path) -> Result<RuntimeState> {
+    Ok(match read_record(path)? {
+        Some(PidRecord::Verified(record)) if record.is_alive()? => RuntimeState::Running,
+        Some(PidRecord::Legacy(pid)) if platform::check_process_alive(pid)? => {
+            RuntimeState::Unverified
+        }
+        _ => RuntimeState::Stopped,
+    })
+}
+
 fn read_record(path: &Path) -> Result<Option<PidRecord>> {
     let Some(text) = fs_support::read_text_if_exists(path)? else {
         return Ok(None);
@@ -342,6 +360,7 @@ pub fn run_candidate(
     stdout: &Path,
     stderr: &Path,
     probe_report: &Path,
+    extra_args: &[&str],
     record: impl FnOnce(ProcessIdentity) -> Result<()>,
 ) -> Result<RunOutcome> {
     let python = platform::venv_python(env);
@@ -360,6 +379,7 @@ pub fn run_candidate(
             .args(["-u", "-c", include_str!("probe.py")])
             .arg(comfyui_dir.join("main.py"))
             .arg(probe_report)
+            .args(extra_args)
             .current_dir(comfyui_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

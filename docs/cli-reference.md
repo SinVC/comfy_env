@@ -5,7 +5,13 @@
   <a href="cli-reference.zh-CN.md"><b>简体中文</b></a>
 </p>
 
-`gov` (`gov.exe` on Windows) is the single-binary CLI for managing ComfyUI dependencies, custom nodes, sandboxed verification transactions, and production runtime operations. Run all commands from your governance project root (the directory containing `config.toml`, `pyproject.toml`, and `uv.lock`, or their `.template` files prior to initialization).
+`gov` (`gov.exe` on Windows) manages ComfyUI dependencies, custom nodes, candidate transactions, and production runtime. In a Release-installed workspace, run `./bin/gov` or `.\bin\gov.exe` from the workspace root. In a manually initialized project, run from the governance directory containing `config.toml`, `pyproject.toml`, and `uv.lock`.
+
+## Workspace installation commands
+
+- `gov setup --workspace <dir> [--mode fresh|migrate] [--python <selector>] [--torch-index-url <url>]` is the Release installer entry point. It uses the two templates beside the extracted executable.
+- `gov status --json` reports configuration, declared dependency groups, the production interpreter, pending recovery IDs, and runtime state for automation.
+- `gov verify [--cpu]` performs a bounded startup check with custom nodes disabled. It exits with code `3` when the checkout lacks a supported native startup probe.
 
 ---
 

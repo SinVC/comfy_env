@@ -151,7 +151,7 @@ pub(crate) fn lock_transaction(
     root: &ProjectRoot,
     tx: &mut TransactionRecord,
 ) -> Result<bool> {
-    let lock = uv.lock_tracked(stage, root, |process| {
+    let lock = uv.lock_tracked(stage, |process| {
         tx.candidate_process = process;
         state_ledger::save_transaction(root, tx)
     })?;
@@ -270,6 +270,12 @@ pub(crate) fn observe_candidate(
         let comfy = root.as_path().join(comfy);
         let probe = tempfile::tempdir_in(&logs)?;
         let report = probe.path().join("result");
+        let cpu = config
+            .run
+            .extra_args
+            .to_args()
+            .iter()
+            .any(|arg| arg == "--cpu");
         let outcome = runtime_executor::run_candidate(
             &candidate,
             &comfy,
@@ -277,6 +283,7 @@ pub(crate) fn observe_candidate(
             &stdout,
             &stderr,
             &report,
+            if cpu { &["--cpu"] } else { &[] },
             |identity| {
                 tx.candidate_process = Some(identity);
                 state_ledger::save_transaction(root, tx)

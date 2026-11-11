@@ -8,7 +8,7 @@ import sys
 
 main = Path(sys.argv[1]).resolve()
 report = Path(sys.argv[2])
-sys.argv[:] = [str(main), "--quick-test-for-ci"]
+sys.argv[:] = [str(main), "--quick-test-for-ci", *sys.argv[3:]]
 sys.path.insert(0, str(main.parent))
 
 # An arbitrary zero exit may precede startup. Accept the SystemExit only

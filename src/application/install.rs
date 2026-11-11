@@ -47,7 +47,7 @@ pub fn cmd_install(args: InstallArgs, root: &ProjectRoot) -> AppResult<()> {
         GroupEditMode::Replace,
         &specs,
     )?;
-    lock_stage(&uv, &staged, root, "install")?;
+    lock_stage(&uv, &staged, "install")?;
 
     promote_install(
         root,
@@ -98,7 +98,7 @@ pub fn cmd_install_torch(args: InstallTorchArgs, root: &ProjectRoot) -> AppResul
         &specs,
     )?;
     toml_support::configure_torch_index(&staged.pyproject_toml(), &args.index_url)?;
-    lock_stage(&uv, &staged, root, "install torch")?;
+    lock_stage(&uv, &staged, "install torch")?;
 
     promote_install(
         root,
@@ -170,10 +170,9 @@ fn ensure_uv_available() -> AppResult<()> {
 fn lock_stage(
     uv: &UvClient,
     staged: &dependency_sync::StagedWorkdir,
-    root: &ProjectRoot,
     action: &str,
 ) -> AppResult<()> {
-    let lock = uv.lock(staged.path(), root)?;
+    let lock = uv.lock(staged.path())?;
     if !lock.success {
         return Err(AppError::runtime(format!(
             "{action} failed during lock: {}",

@@ -83,24 +83,19 @@ impl UvClient {
         crate::platform::PythonClient::version_minor(Path::new(&found.stdout))
     }
 
-    pub fn lock(&self, project_dir: &Path, root: &ProjectRoot) -> Result<CmdResult> {
-        run_uv(&mut self.lock_command(project_dir, root)?)
+    pub fn lock(&self, project_dir: &Path) -> Result<CmdResult> {
+        run_uv(&mut self.lock_command(project_dir)?)
     }
 
     pub fn lock_tracked(
         &self,
         project_dir: &Path,
-        root: &ProjectRoot,
         record: impl FnMut(Option<crate::platform::ProcessIdentity>) -> Result<()>,
     ) -> Result<CmdResult> {
-        crate::runtime_executor::run_tracked_command(
-            &self.lock_command(project_dir, root)?,
-            None,
-            record,
-        )
+        crate::runtime_executor::run_tracked_command(&self.lock_command(project_dir)?, None, record)
     }
 
-    fn lock_command(&self, project_dir: &Path, root: &ProjectRoot) -> Result<Command> {
+    fn lock_command(&self, project_dir: &Path) -> Result<Command> {
         validate_relocatable_project(&crate::toml_support::read_project(
             &project_dir.join("pyproject.toml"),
         )?)?;
@@ -108,7 +103,7 @@ impl UvClient {
         command
             .current_dir(project_dir)
             .args(["lock", "--python", &self.python]);
-        normalize_find_links(&mut command, root.as_path());
+        normalize_find_links(&mut command, &std::env::current_dir()?);
         Ok(command)
     }
 

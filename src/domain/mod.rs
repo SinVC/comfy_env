@@ -58,7 +58,22 @@ impl ProjectRoot {
         let root = std::env::current_dir().map_err(|error| {
             AppError::runtime(format!("failed to resolve project root: {error}"))
         })?;
-        Ok(Self { root })
+        let sidecar = root.join("ComfyUI.gov");
+        if root
+            .join("bin")
+            .join(if cfg!(windows) { "gov.exe" } else { "gov" })
+            .is_file()
+            && ((sidecar.join("config.toml").is_file() && sidecar.join("pyproject.toml").is_file())
+                || (sidecar.join("config.toml.template").is_file()
+                    && sidecar.join("pyproject.toml.template").is_file()))
+        {
+            return Ok(Self::at(sidecar));
+        }
+        Ok(Self::at(root))
+    }
+
+    pub(crate) fn at(root: PathBuf) -> Self {
+        Self { root }
     }
 
     pub fn as_path(&self) -> &Path {

@@ -7,14 +7,14 @@ description: Use when running or troubleshooting the `gov` (`gov.exe`) CLI to ma
 
 `gov` (`gov.exe` on Windows) manages ComfyUI dependencies, custom nodes, sandboxed verification transactions (`.venv-candidate`), and production runtime (`.venv-prod`).
 
-**Working Directory Rule**: Always invoke `gov` from the governance project root (the directory containing `config.toml`, `pyproject.toml`, and `uv.lock`, or their `.template` files before initialization).
+**Working Directory Rule**: From a Release-installed workspace, invoke `./bin/gov <command>` on Linux or `.\bin\gov.exe <command>` on Windows. The CLI selects the workspace's `ComfyUI.gov/` sidecar. The examples use `gov` as shorthand for this executable. For a manually initialized project, run from the sidecar directory containing `config.toml`, `pyproject.toml`, and `uv.lock`.
 
 ## 1. Pre-Flight Check (`gov status`)
 
 Before executing multi-step workflows or troubleshooting errors, inspect current state:
 
 ```bash
-gov status
+./bin/gov status
 ```
 
 Key fields returned:

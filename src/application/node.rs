@@ -146,7 +146,7 @@ pub fn cmd_node_remove(args: NodeRemoveArgs, root: &ProjectRoot) -> AppResult<()
     if let Some(group) = toml_support::existing_group_name(&project, &plugin.group)? {
         toml_support::remove_dependency_group(&staged.pyproject_toml(), &group)?;
     }
-    let lock = uv.lock(staged.path(), root)?;
+    let lock = uv.lock(staged.path())?;
     if !lock.success {
         return Err(AppError::runtime(format!(
             "node remove lock failed: {}",

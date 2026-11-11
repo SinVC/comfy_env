@@ -56,10 +56,13 @@ pub fn cmd_init(args: InitArgs, root: &ProjectRoot) -> AppResult<()> {
         platform::platform_machine()
     );
     toml_support::configure_init(&mut config_doc, comfyui_dir, &python)?;
+    if args.cpu {
+        toml_support::configure_cpu(&mut config_doc, &config)?;
+    }
     let project_path = root.pyproject_toml();
     let project_doc = toml_support::project_for_init(&project_path, &python, &marker)?;
     let stage = dependency_sync::stage_init(root, &project_doc.to_string())?;
-    ensure_uv_success(&uv.lock(stage.path(), root)?, "lock")?;
+    ensure_uv_success(&uv.lock(stage.path())?, "lock")?;
 
     let state = root.state_dir();
     for path in [

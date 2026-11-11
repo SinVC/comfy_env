@@ -1,0 +1,147 @@
+name: Build and release gov
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gov-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and package (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: gov.exe
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            binary: gov
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: '0.13.7'
+      - name: Prepare Rust and Linux linker
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y musl-tools
+          fi
+      - name: Test and build the binary
+        run: |
+          cargo test --locked --target "${{ matrix.target }}"
+          cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Run environment and rollback regressions
+        run: |
+          uv python install 3.13
+          gov="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          python tests/slice3_black_box.py "$gov"
+          python tests/release_black_box.py "$gov" "$(uv python find 3.13)"
+          python tests/workspace_black_box.py "$gov"
+      - name: Build the archives and installers
+        run: |
+          tag=$(python -c 'import tomllib; print("v" + tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tag="$GITHUB_REF_NAME"; fi
+          python release/package.py --tag "$tag" --output dist --target "${{ matrix.target }}" --binary "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          if [ "$RUNNER_OS" = Linux ]; then
+            python release/package.py --tag "$tag" --output dist
+            sh -n dist/install.sh
+          fi
+      - name: Verify the packaged binary against upstream ComfyUI
+        if: github.event_name != 'pull_request'
+        run: |
+          package="$RUNNER_TEMP/gov-release"
+          mkdir -p "$package"
+          if [ "$RUNNER_OS" = Linux ]; then
+            tar -xzf dist/gov-x86_64-unknown-linux-musl.tar.gz -C "$package"
+          else
+            python -m zipfile -e dist/gov-x86_64-pc-windows-msvc.zip "$package"
+          fi
+          "$package/${{ matrix.binary }}" setup --workspace "$RUNNER_TEMP/ComfyUIWorkspace" --python "$(python -c 'import sys; print(sys.executable)')"
+      - name: Validate the PowerShell installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'release/install.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count) { throw ($errors | Out-String) }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gov-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  legacy:
+    name: Legacy Bash baseline
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Record the historical baseline
+        continue-on-error: true
+        run: |
+          snapshot=$(mktemp -d)
+          git archive HEAD | tar -xf - -C "$snapshot"
+          bash "$snapshot/tests/test_gov_cli.sh"
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: gov-*
+          path: dist
+          merge-multiple: true
+      - name: Upload and publish the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          assets=(
+            dist/gov-x86_64-unknown-linux-musl.tar.gz{,.sha256}
+            dist/gov-x86_64-pc-windows-msvc.zip{,.sha256}
+            dist/install.sh dist/install.ps1
+          )
+          for asset in "${assets[@]}"; do test -s "$asset"; done
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft); then
+            if [ "$draft" != true ]; then
+              echo "Release $TAG is already published; published assets are preserved."
+              exit 0
+            fi
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" --verify-tag --draft --generate-notes
+          fi
+          gh release edit "$TAG" --draft=false

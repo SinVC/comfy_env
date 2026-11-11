@@ -7,6 +7,7 @@ pub mod pin;
 mod production;
 pub mod resolve;
 pub mod runtime;
+mod setup;
 pub mod status;
 pub mod tx;
 pub mod undo;
@@ -21,9 +22,16 @@ use crate::domain::{AppError, AppResult, OpId, ProjectRoot};
 use crate::toml_support::{self, RuntimeConfig};
 
 pub fn dispatch(cli: Cli) -> AppResult<i32> {
+    if let Commands::Setup(args) = cli.command {
+        return setup::cmd_setup(args);
+    }
     let root = ProjectRoot::discover()?;
+    dispatch_at(cli.command, &root)
+}
+
+fn dispatch_at(command: Commands, root: &ProjectRoot) -> AppResult<i32> {
     let writes_production = matches!(
-        &cli.command,
+        &command,
         Commands::Init(_)
             | Commands::Install(_)
             | Commands::Undo(_)
@@ -42,13 +50,13 @@ pub fn dispatch(cli: Cli) -> AppResult<i32> {
             })
     );
     let recovers = matches!(
-        &cli.command,
+        &command,
         Commands::Op(crate::cli::OpArgs {
             command: OpSubcommand::Recover(_)
         })
     );
     let aborts = matches!(
-        &cli.command,
+        &command,
         Commands::Tx(crate::cli::TxArgs {
             command: TxSubcommand::Abort(_)
         }) | Commands::Update(crate::cli::UpdateArgs {
@@ -65,7 +73,7 @@ pub fn dispatch(cli: Cli) -> AppResult<i32> {
     if writes_production {
         crate::runtime_executor::ensure_prod_stopped(&root.pid_file())?;
         if !matches!(
-            &cli.command,
+            &command,
             Commands::Undo(_)
                 | Commands::Tx(crate::cli::TxArgs {
                     command: TxSubcommand::Promote(_)
@@ -78,7 +86,8 @@ pub fn dispatch(cli: Cli) -> AppResult<i32> {
         }
     }
 
-    match cli.command {
+    match command {
+        Commands::Setup(_) => unreachable!("setup dispatches before project discovery"),
         Commands::Init(args) => init::cmd_init(args, &root),
         Commands::Install(args) => match args.command {
             Some(InstallSubcommand::Torch(torch_args)) => {
@@ -129,7 +138,8 @@ pub fn dispatch(cli: Cli) -> AppResult<i32> {
         Commands::Undo(args) => undo::cmd_undo(args, &root),
         Commands::Run(args) => return runtime::cmd_run(args, &root),
         Commands::Stop => runtime::cmd_stop(&root),
-        Commands::Status => status::cmd_status(&root),
+        Commands::Status(args) => status::cmd_status(root, args.json),
+        Commands::Verify(args) => return runtime::cmd_verify(root, args.cpu),
     }
     .map(|()| 0)
 }

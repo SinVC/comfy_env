@@ -6,8 +6,7 @@ use crate::source_integration::GitClient;
 use crate::state_ledger::{self, TransactionRecord};
 use crate::toml_support::{self, RuntimeConfig};
 
-pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
-    let config = toml_support::read_config(&root.config_toml())?;
+pub(super) fn dependency_readiness(root: &ProjectRoot) -> AppResult<(bool, bool)> {
     let project = toml_support::read_project(&root.pyproject_toml())?;
     let torch: Vec<_> = toml_support::dependency_group(&project, "torch")?
         .iter()
@@ -17,6 +16,12 @@ pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
         .iter()
         .all(|name| torch.iter().any(|pkg| pkg == name));
     let core_ready = !toml_support::dependency_group(&project, "core")?.is_empty();
+    Ok((torch_ready, core_ready))
+}
+
+pub fn cmd_status(root: &ProjectRoot, json: bool) -> AppResult<()> {
+    let config = toml_support::read_config(&root.config_toml())?;
+    let (torch_ready, core_ready) = dependency_readiness(root)?;
     let config_ready = config.as_ref().is_some_and(|cfg| {
         cfg.paths
             .comfyui_dir
@@ -35,6 +40,38 @@ pub fn cmd_status(root: &ProjectRoot) -> AppResult<()> {
         .filter(|op| op.needs_recovery())
         .map(|op| op.op_id)
         .collect::<Vec<_>>();
+    if json {
+        let (runtime_state, runtime_error) =
+            match crate::runtime_executor::verified_runtime_state(&root.pid_file()) {
+                Ok(state) => (state, None),
+                Err(error) => (
+                    crate::runtime_executor::RuntimeState::Unverified,
+                    Some(format!("{error:#}")),
+                ),
+            };
+        let value = serde_json::json!({
+            "project_root": root.as_path(),
+            "config_ready": config_ready,
+            "comfyui_dir": config.as_ref().and_then(|cfg| cfg.paths.comfyui_dir.as_ref()),
+            "python": config.as_ref().and_then(|cfg| cfg.runtime.python.as_ref()),
+            "prod_env_exists": prod_env_exists(root, config.as_ref()),
+            "prod_python_exists": config.as_ref().is_some_and(|cfg| {
+                crate::platform::venv_python(&root.as_path().join(&cfg.runtime.prod_env)).is_file()
+            }),
+            "torch_ready": torch_ready,
+            "core_ready": core_ready,
+            "lock_exists": root.uv_lock().is_file(),
+            "operations_needing_recovery": pending,
+            "runtime_state": runtime_state,
+            "runtime_error": runtime_error,
+            "plugins_registered": plugins.len(),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(anyhow::Error::from)?
+        );
+        return Ok(());
+    }
     let runtime = match crate::runtime_executor::runtime_status(&root.pid_file()) {
         Ok(runtime) => runtime,
         Err(error) => {

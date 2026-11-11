@@ -62,6 +62,28 @@ Workspace/
 
 ---
 
+## Install a workspace
+
+Install Git, uv, and Python 3.12 first. The installer uses the CPU PyTorch index by default. To use a GPU-specific index, supply `--torch-index-url` on Linux or set `GOV_TORCH_INDEX_URL` on Windows.
+
+**Linux x86-64**
+
+```sh
+curl -fsSL https://github.com/SinVC/comfy_env/releases/latest/download/install.sh |
+  sh -s -- --workspace "$PWD/ComfyUIWorkspace"
+```
+
+**Windows x64**
+
+```powershell
+$env:GOV_WORKSPACE = 'D:\AI\ComfyUIWorkspace'
+irm https://github.com/SinVC/comfy_env/releases/latest/download/install.ps1 | iex
+```
+
+To use an existing ComfyUI Git checkout, place it at `ComfyUIWorkspace/ComfyUI/` before running the installer. Pass `--mode migrate` on Linux or set `$env:GOV_SETUP_MODE = 'migrate'` on Windows. The installer builds a fresh managed Python environment from the checkout's requirements. Manage models and model paths through ComfyUI.
+
+From the workspace, start ComfyUI with `./bin/gov run` or `.\bin\gov.exe run`. The optional Agent Skill is in [`skills/gov-cli/`](skills/gov-cli/SKILL.md). Install it from the same Git tag as the CLI.
+
 ## Quick Start
 
 ### 1. Initialize & Bootstrap

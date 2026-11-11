@@ -8,6 +8,36 @@ use crate::domain::{CmdResult, NodeId};
 pub struct GitClient;
 
 impl GitClient {
+    pub fn checkout_release(url: &str, target: &Path, tag: &str) -> Result<CmdResult> {
+        let output = Command::new("git")
+            .args(["clone", "--depth", "1", "--branch", tag, "--", url])
+            .arg(target)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "Never")
+            .output()
+            .context("failed to clone the ComfyUI release")?;
+        Ok(CmdResult::from_output(output))
+    }
+
+    pub fn revision(repo: &Path, reference: &str) -> Result<CmdResult> {
+        Self::rev_parse(repo, &["--verify", reference])
+    }
+
+    pub fn worktree_root(repo: &Path) -> Result<CmdResult> {
+        Self::rev_parse(repo, &["--show-toplevel"])
+    }
+
+    fn rev_parse(repo: &Path, args: &[&str]) -> Result<CmdResult> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .arg("rev-parse")
+            .args(args)
+            .output()
+            .context("failed to inspect the ComfyUI checkout")?;
+        Ok(CmdResult::from_output(output))
+    }
+
     pub fn version() -> Result<CmdResult> {
         let output = Command::new("git")
             .arg("--version")

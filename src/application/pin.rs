@@ -117,7 +117,7 @@ fn apply_pins(
         Vec::new()
     };
     toml_support::edit_pins(&staged.pyproject_toml(), specs, &force, remove)?;
-    let lock = uv.lock(staged.path(), root)?;
+    let lock = uv.lock(staged.path())?;
     if !lock.success {
         return Err(AppError::runtime(format!(
             "{action} failed during lock: {}",

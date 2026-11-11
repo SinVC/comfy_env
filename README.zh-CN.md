@@ -62,6 +62,28 @@
 
 ---
 
+## 安装工作区
+
+先安装 Git、uv 和 Python 3.12。安装器默认使用 CPU 版 PyTorch。使用 GPU 时，在 Linux 传入 `--torch-index-url`，在 Windows 设置 `GOV_TORCH_INDEX_URL`，指定对应的 PyTorch 索引。
+
+**Linux x86-64**
+
+```sh
+curl -fsSL https://github.com/SinVC/comfy_env/releases/latest/download/install.sh |
+  sh -s -- --workspace "$PWD/ComfyUIWorkspace"
+```
+
+**Windows x64**
+
+```powershell
+$env:GOV_WORKSPACE = 'D:\AI\ComfyUIWorkspace'
+irm https://github.com/SinVC/comfy_env/releases/latest/download/install.ps1 | iex
+```
+
+复用已有 ComfyUI 时，先自行将 Git checkout 放到工作区的 `ComfyUI/`。Linux 加 `--mode migrate`，Windows 设置 `$env:GOV_SETUP_MODE = 'migrate'`。安装器根据该源码的依赖声明重新建立治理环境。模型和路径配置由用户在 ComfyUI 中管理。
+
+安装后在工作区运行 `./bin/gov run` 或 `.\bin\gov.exe run`。可选的 Agent Skill 位于 [`skills/gov-cli/`](skills/gov-cli/SKILL.md)，可从 CLI 对应的 Git tag 安装。
+
 ## 极速上手
 
 ### 1. 初始化与生产引导
@@ -137,7 +159,7 @@ gov undo <op_id>
 `gov` 采用纯 Rust 编写，无第三方 C 运行库外部依赖：
 
 ```bash
-# 依赖环境：Rust 1.75+ 与 Cargo
+# 依赖环境：当前稳定版 Rust 与 Cargo
 cargo build --release
 
 # 编译产物位置：

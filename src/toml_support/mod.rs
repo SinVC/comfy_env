@@ -200,6 +200,23 @@ pub fn project_for_init(path: &Path, python: &str, marker: &str) -> Result<Docum
     Ok(doc)
 }
 
+pub fn configure_cpu(doc: &mut DocumentMut, config: &RuntimeConfig) -> Result<()> {
+    let args = config.run.extra_args.to_args();
+    if !args.iter().any(|arg| arg == "--cpu") {
+        let mut args: Array = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        args.push("--cpu");
+        set_value(
+            ensure_table(doc.as_table_mut(), "run")?,
+            "extra_args",
+            Value::Array(args),
+        );
+    }
+    Ok(())
+}
+
 fn read_or_template(path: &Path) -> Result<DocumentMut> {
     let (text, source) = match crate::fs_support::read_text_if_exists(path)? {
         Some(text) => (text, path.to_owned()),

@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use crate::cli::RunArgs;
 use crate::dependency_sync::UvClient;
 use crate::domain::{AppError, AppResult, ProjectRoot};
-use crate::runtime_executor::{self, StopOutcome};
+use crate::runtime_executor::{self, RunOutcome, StopOutcome};
 use crate::state_ledger::OpKind;
 use crate::toml_support::{self, RuntimeConfig};
+use anyhow::Context;
 
 pub fn cmd_run(args: RunArgs, root: &ProjectRoot) -> AppResult<i32> {
     let guard = runtime_executor::try_lock_production(&root.pid_file())?;
@@ -82,4 +83,67 @@ pub fn cmd_stop(root: &ProjectRoot) -> AppResult<()> {
     };
     println!("{message}");
     Ok(())
+}
+
+pub fn cmd_verify(root: &ProjectRoot, cpu: bool) -> AppResult<i32> {
+    let _guard = runtime_executor::try_lock_production(&root.pid_file())?;
+    runtime_executor::ensure_prod_stopped(&root.pid_file())?;
+    crate::safety_guards::ensure_production_recoverable(root)?;
+    let config = toml_support::read_config(&root.config_toml())?
+        .ok_or_else(|| AppError::usage("config.toml is required"))?;
+    let comfy = configured_entry(root, &config)?;
+    let env = root.as_path().join(&config.runtime.prod_env);
+    let logs_root = root.state_dir().join("logs");
+    std::fs::create_dir_all(&logs_root)?;
+    let logs = tempfile::Builder::new()
+        .prefix("verify-")
+        .tempdir_in(logs_root)
+        .context("failed to create startup probe logs")?;
+    let report = logs.path().join("result");
+    let mut probe_args = vec!["--disable-all-custom-nodes"];
+    if cpu
+        || config
+            .run
+            .extra_args
+            .to_args()
+            .iter()
+            .any(|arg| arg == "--cpu")
+    {
+        probe_args.push("--cpu");
+    }
+    let outcome = runtime_executor::run_candidate(
+        &env,
+        &comfy,
+        config.tx.timeout_seconds,
+        &logs.path().join("stdout.log"),
+        &logs.path().join("stderr.log"),
+        &report,
+        &probe_args,
+        |_| Ok(()),
+    );
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Err(error
+                .context(format!("startup probe logs: {}", logs.keep().display()))
+                .into());
+        }
+    };
+    match (
+        outcome,
+        crate::fs_support::read_text_if_exists(&report)?.as_deref(),
+    ) {
+        (RunOutcome::Passed, Some("completed")) => {
+            println!("ComfyUI core startup verified.");
+            Ok(0)
+        }
+        (RunOutcome::Failed(1), Some("unsupported")) => {
+            eprintln!("This ComfyUI revision does not support the startup probe.");
+            Ok(3)
+        }
+        (outcome, _) => Err(AppError::runtime(format!(
+            "ComfyUI startup probe {outcome:?}. Logs: {}",
+            logs.keep().display()
+        ))),
+    }
 }

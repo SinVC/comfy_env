@@ -5,7 +5,13 @@
   <a href="cli-reference.zh-CN.md"><b>简体中文</b></a>
 </p>
 
-`gov`（Windows 下为 `gov.exe`）是一个单二进制 CLI 工具，用于治理 ComfyUI 依赖、管理自定义节点、执行沙盒隔离的依赖验证事务，并托管生产环境运行。请在治理项目根目录（即包含 `config.toml`、`pyproject.toml` 和 `uv.lock`，或首次初始化前包含对应 `.template` 模板的目录）下执行所有命令。
+`gov`（Windows 下为 `gov.exe`）用于治理 ComfyUI 依赖、管理自定义节点、执行候选事务并托管生产环境。通过 Release 安装后，在工作区根目录运行 `./bin/gov` 或 `.\bin\gov.exe`。手动初始化的项目在包含 `config.toml`、`pyproject.toml` 和 `uv.lock` 的治理目录中运行。
+
+## 工作区安装命令
+
+- `gov setup --workspace <目录> [--mode fresh|migrate] [--python <选择器>] [--torch-index-url <URL>]` 是 Release 安装入口，使用解压后二进制旁的两份模板。
+- `gov status --json` 输出治理配置、依赖组声明、生产环境解释器、待恢复操作 ID 和进程状态。
+- `gov verify [--cpu]` 在禁用自定义节点的情况下执行限时启动探测。源码版本缺少受支持的原生探测时返回退出码 `3`。
 
 ---
 

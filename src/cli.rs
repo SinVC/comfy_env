@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -19,6 +19,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Install or resume a managed ComfyUI workspace
+    Setup(SetupArgs),
     /// Bootstrap the project and production environment
     Init(InitArgs),
     /// Install managed ComfyUI or PyTorch dependencies
@@ -44,7 +46,42 @@ pub enum Commands {
     /// Stop ComfyUI launched by gov run
     Stop,
     /// Report project and runtime status
-    Status,
+    Status(StatusArgs),
+    /// Verify that the managed ComfyUI environment can start
+    Verify(VerifyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct StatusArgs {
+    /// Emit machine-readable workspace status
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct VerifyArgs {
+    /// Run the startup check in CPU mode
+    #[arg(long)]
+    pub cpu: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SetupMode {
+    Fresh,
+    Migrate,
+}
+
+#[derive(Debug, Args)]
+pub struct SetupArgs {
+    /// Directory containing bin, ComfyUI, and ComfyUI.gov
+    #[arg(long)]
+    pub workspace: PathBuf,
+    #[arg(long, value_enum, default_value = "fresh")]
+    pub mode: SetupMode,
+    #[arg(long, default_value = "3.12")]
+    pub python: String,
+    #[arg(long, default_value = "https://download.pytorch.org/whl/cpu")]
+    pub torch_index_url: String,
 }
 
 #[derive(Debug, Args)]
@@ -55,6 +92,9 @@ pub struct InitArgs {
     /// Python minor version or interpreter selector
     #[arg(long)]
     pub python: Option<String>,
+    /// Configure ComfyUI to run in CPU mode
+    #[arg(long)]
+    pub cpu: bool,
 }
 
 #[derive(Debug, Args)]
