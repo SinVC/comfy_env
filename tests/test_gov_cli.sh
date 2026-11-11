@@ -1095,7 +1095,7 @@ assert_contains "$status_out" "python: 3.12"
 assert_contains "$status_out" "torch_ready: no"
 
 set +e
-bash "$WORK_DIR/bin/gov" install >"$TMP_ROOT/install.err" 2>&1
+PATH="$FAKE_BIN:$PATH" bash "$WORK_DIR/bin/gov" install >"$TMP_ROOT/install.err" 2>&1
 rc=$?
 set -e
 if [ "$rc" -eq 0 ]; then
